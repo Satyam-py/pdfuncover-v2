@@ -41,9 +41,18 @@ This module performs NO detection and NO new IOC extraction. It:
 
 The Threat Intelligence engine/models/providers themselves are
 FROZEN and are only ever imported here, never modified.
+
+CONFIG CONSOLIDATION NOTE: provider credential loading no longer owns
+its own config file/env logic. It now delegates to modules.app_config
+— the single configuration source shared with main.py's own
+VirusTotal key handling (previously this module read
+".threat_intel_config.json" while main.py separately read
+".pdfuncover_config.json"; both are now one file). load_provider_config()
+is kept as a thin wrapper with its original name/signature/return
+shape so modules/embedded_extraction.py's existing call site needs no
+changes.
 """
 
-import json
 import logging
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -58,6 +67,7 @@ from modules.threat_intel.models import (
     LookupError,
 )
 from modules.threat_intel.engine import enrich_ioc
+from modules.app_config import get_provider_config
 
 
 # ==========================================
@@ -82,62 +92,33 @@ log = logging.getLogger(__name__)
 # The frozen engine's enrich_ioc(ioc, config) takes a plain dict of
 # provider credentials, e.g. {"virustotal_api_key": "...", ...} — see
 # the config_key values on each ProviderRegistration in
-# modules/threat_intel/engine.py's PROVIDERS list. This loader is
-# intentionally independent of the OLDER modules/config.py (the
-# previous, now-superseded provider system's config loader) — it reads
-# the same environment variables / local JSON file directly rather
-# than importing anything from that older system, so this module has
-# no dependency on it either way.
+# modules/threat_intel/engine.py's PROVIDERS list. Credential
+# resolution itself (env var vs. config file, precedence) now lives
+# entirely in modules.app_config — this module no longer duplicates
+# that logic.
 
 MAX_WORKERS = 5
-
-_CONFIG_FILE = ".threat_intel_config.json"
-
-# provider config_key (as used by ProviderRegistration in engine.py) -> env var
-_ENV_KEY_NAMES: Dict[str, str] = {
-    "virustotal_api_key": "VT_API_KEY",
-    "otx_api_key": "OTX_API_KEY",
-    "abuseipdb_api_key": "ABUSEIPDB_API_KEY",
-}
 
 
 def load_provider_config() -> Dict[str, Any]:
     """
     Best-effort provider credential loader.
 
-    Resolution order per key: environment variable, then the local
-    JSON config file, matching the precedence the previous provider
-    system used. Never raises — a missing or malformed config file, or
-    no credentials configured at all, simply resolves to an empty (or
-    partially empty) dict, which the frozen engine already handles
-    gracefully (providers requiring a key it doesn't have are skipped,
-    not treated as failures).
+    Thin wrapper around modules.app_config.get_provider_config() —
+    kept under this name so modules/embedded_extraction.py's existing
+    call site (`ti_config = load_provider_config()`) needs no changes.
+    Never raises: a missing/malformed config file, or no credentials
+    configured at all, simply resolves to an empty (or partially
+    empty) dict, which the frozen engine already handles gracefully
+    (providers requiring a key it doesn't have are skipped, not
+    treated as failures).
     """
 
-    config: Dict[str, Any] = {}
-
-    if os.path.exists(_CONFIG_FILE):
-        try:
-            with open(_CONFIG_FILE, "r") as f:
-                data = json.load(f)
-
-            providers = data.get("providers", {}) if isinstance(data, dict) else {}
-
-            for config_key in _ENV_KEY_NAMES:
-                provider_name = config_key[: -len("_api_key")]
-                entry = providers.get(provider_name, {})
-                if isinstance(entry, dict) and entry.get("api_key"):
-                    config[config_key] = entry["api_key"]
-
-        except (OSError, ValueError) as e:
-            log.error(f"Could not read {_CONFIG_FILE}: {e}")
-
-    for config_key, env_var in _ENV_KEY_NAMES.items():
-        env_val = os.environ.get(env_var)
-        if env_val:
-            config[config_key] = env_val  # env overrides the file
-
-    return config
+    try:
+        return get_provider_config()
+    except Exception as e:
+        log.error(f"Failed to load threat-intel provider config: {e}")
+        return {}
 
 
 # ==========================================
@@ -359,11 +340,7 @@ def enrich_extracted_iocs(
         return {**legacy, "_typed": typed}
 
     if config is None:
-        try:
-            config = load_provider_config()
-        except Exception as e:
-            log.error(f"Failed to load threat-intel provider config: {e}")
-            config = {}
+        config = load_provider_config()
 
     # Cache by (type, value) so the SAME unique IOC — already
     # deduplicated by _collect_jobs() — is only ever enriched once,

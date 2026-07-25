@@ -19,6 +19,18 @@ No detection/scoring logic lives here — this module is purely
 orchestration + presentation. Every module above already exists and
 is used through its existing public API; nothing here duplicates
 logic that already lives in one of those modules.
+
+CONFIG CONSOLIDATION NOTE: API key loading/saving delegates to
+modules.app_config — the single configuration source shared with
+modules/threat_intel_pipeline.py's provider credentials.
+
+SHIM REMOVAL NOTE: the VirusTotal hash lookup previously went through
+modules.virustotal.query_virustotal() — a temporary compatibility
+shim that adapted the typed provider's ProviderResult back into a
+flat dict. That shim is gone. This file now calls the typed provider
+(modules.threat_intel.providers.virustotal.lookup_hash) directly and
+does the same adaptation itself, in _vt_hash_result_to_metadata()
+below — same output shape, same call site, one fewer file in between.
 """
 
 import argparse
@@ -37,11 +49,13 @@ from colorama import Fore, Style, init
 from modules.metadata import extract_metadata
 from modules.embedded_extraction import extract_embedded_objects
 from modules.analyzer import analyze_results
-from modules.virustotal import query_virustotal
+from modules.threat_intel.providers.virustotal import lookup_hash as vt_lookup_hash
+from modules.threat_intel.models import LookupError
 from modules.correlation import ThreatCorrelationEngine
 from modules.evidence_explorer import build_evidence_graph
 from modules.attack_chain import reconstruct_attack_chain
 from modules.report import generate_professional_report
+from modules.app_config import load_config, save_api_key
 from modules.parsers.evidence import (
     SEVERITY_CRITICAL,
     SEVERITY_HIGH,
@@ -83,33 +97,54 @@ log = logging.getLogger(__name__)
 
 
 # ==========================================
-# CONFIG
+# VIRUSTOTAL HASH LOOKUP (typed provider, adapted for metadata output)
 # ==========================================
+#
+# Replaces the old modules.virustotal.query_virustotal() shim. Calls
+# the typed VirusTotal provider directly and reshapes its
+# ProviderResult into the exact same flat dict shape the shim used to
+# produce, so metadata["VirusTotal"] — and everything that reads it
+# (modules.analyzer._score_virustotal / _build_virustotal_evidence,
+# modules.evidence_explorer's hash-level VT artifact) — is byte-for-byte
+# unchanged:
+#
+#   found, no detections   -> {"Found": True, "Malicious": 0, "Suspicious": 0,
+#                               "Harmless": N, "Undetected": N, "Total": N,
+#                               "Link": "https://..."}
+#   hash not on record      -> {"Found": True, "Known Sample": False,
+#                               "Message": "Hash not found in VirusTotal"}
+#   lookup failed            -> {"Found": False, "Error": "<reason>"}
 
-CONFIG_FILE = ".pdfuncover_config.json"
+def query_virustotal(sha256: str, api_key: str) -> Dict[str, Any]:
+    """Typed-provider-backed replacement for the old shim of the same name."""
 
+    result = vt_lookup_hash(sha256, api_key)
 
-def load_config() -> Dict[str, Any]:
-    """Load the local JSON config file. Returns {} if missing/corrupt."""
+    if not result.success:
 
-    if not os.path.exists(CONFIG_FILE):
-        return {}
+        if result.error == LookupError.NOT_FOUND:
+            return {
+                "Found": True,
+                "Known Sample": False,
+                "Message": "Hash not found in VirusTotal",
+            }
 
-    try:
-        with open(CONFIG_FILE, "r") as f:
-            return json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return {}
+        return {
+            "Found": False,
+            "Error": result.error.value if result.error else "unknown error",
+        }
 
+    rep = result.data.reputation
 
-def save_api_key(api_key: str) -> None:
-    """Persist a VirusTotal API key into the local JSON config file."""
-
-    config = load_config()
-    config["virustotal_api_key"] = api_key
-
-    with open(CONFIG_FILE, "w") as f:
-        json.dump(config, f, indent=4)
+    return {
+        "Found": True,
+        "Malicious": rep.malicious,
+        "Suspicious": rep.suspicious,
+        "Harmless": rep.harmless,
+        "Undetected": rep.undetected,
+        "Total": rep.total,
+        "Link": rep.permalink,
+    }
 
 
 # ==========================================
@@ -744,7 +779,9 @@ def main() -> None:
     # metadata dict as metadata["VirusTotal"], since that is the exact
     # shape modules.analyzer (_score_virustotal /
     # _build_virustotal_evidence) and modules.evidence_explorer already
-    # expect and read from — wiring it in, not new detection logic.
+    # expect and read from — wiring it in, not new detection logic. The
+    # lookup itself now goes straight to the typed VirusTotal provider
+    # via query_virustotal() defined above (no shim in between).
 
     status("Extracting metadata...")
 
@@ -790,9 +827,9 @@ def main() -> None:
     # This single call already runs every parser (header, streams, JS,
     # IOCs, embedded files, images, compression, encryption, AcroForm)
     # and performs IOC threat-intelligence enrichment internally
-    # (modules.parsers.iocs -> modules.parsers.ioc_enrichment ->
-    # modules.threat_intel.ThreatIntelManager) — so IOC lookups happen
-    # exactly once per run, with no duplicate lookups downstream.
+    # (modules.parsers.iocs -> modules.threat_intel_pipeline ->
+    # modules.threat_intel.engine) — so IOC lookups happen exactly once
+    # per run, with no duplicate lookups downstream.
 
     status("Analyzing embedded objects (header/streams/js/iocs/forms)...")
 
