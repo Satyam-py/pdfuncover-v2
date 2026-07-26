@@ -17,7 +17,8 @@ follows the same 11-section order defined in the spec:
     8. Network Indicators
     9. MITRE ATT&CK Mapping
     10. Analyst Recommendations
-    11. Appendix
+    11. Attack Chain
+    12. Appendix
 
 Shared section-ordering / labeling logic lives in _SECTION_TITLES so
 the four renderers can't drift out of sync with each other.
@@ -29,6 +30,7 @@ from typing import List
 
 from modules.report.model import (
     ReportModel, EvidenceTreeNode, CorrelatedFinding, ThreatIntelEntry,
+    AttackChainStep,
 )
 
 
@@ -43,6 +45,7 @@ SECTION_TITLES = [
     "Network Indicators",
     "MITRE ATT&CK Mapping",
     "Analyst Recommendations",
+    "Attack Chain",
     "Appendix",
 ]
 
@@ -204,9 +207,26 @@ def render_text(model: ReportModel) -> str:
         w("  No specific recommendations.")
     w()
 
-    # 11. Appendix
-    ap = model.appendix
+    # 11. Attack Chain
     w(sep); w(f"  11. {SECTION_TITLES[10].upper()}"); w(sep)
+    if model.attack_chain:
+        for step in model.attack_chain:
+            conf = step.confidence
+            w(f"  Step {step.step}: {step.title}  [{conf} confidence]")
+            w(f"      {step.description}")
+            if step.evidence:
+                for ev in step.evidence:
+                    w(f"        · {ev}")
+            if step.mitre:
+                w(f"      MITRE ATT&CK : {', '.join(step.mitre)}")
+            w()
+    else:
+        w("  No attack chain reconstructed from static evidence.")
+        w()
+
+    # 12. Appendix
+    ap = model.appendix
+    w(sep); w(f"  12. {SECTION_TITLES[11].upper()}"); w(sep)
     w(f"  Analysis Timestamp : {ap.analysis_timestamp}")
     w(f"  Tool Version       : {ap.tool_version}")
     w(f"  Parsers Used       : {', '.join(ap.parser_info) or 'None'}")
@@ -364,8 +384,25 @@ def render_markdown(model: ReportModel) -> str:
         w("_No specific recommendations._")
     w()
 
+    w("## 11. Attack Chain")
+    if model.attack_chain:
+        for step in model.attack_chain:
+            w(f"### Step {step.step}: {step.title}")
+            w(f"- **Confidence:** {step.confidence}")
+            w(f"- **Description:** {step.description}")
+            if step.evidence:
+                w("- **Evidence:**")
+                for ev in step.evidence:
+                    w(f"  - {ev}")
+            if step.mitre:
+                w(f"- **MITRE ATT&CK:** {', '.join(step.mitre)}")
+            w()
+    else:
+        w("_No attack chain reconstructed from static evidence._")
+        w()
+
     ap = model.appendix
-    w("## 11. Appendix")
+    w("## 12. Appendix")
     w(f"- **Analysis Timestamp:** {ap.analysis_timestamp}")
     w(f"- **Tool Version:** {ap.tool_version}")
     w(f"- **Parsers Used:** {', '.join(ap.parser_info) or 'None'}")
@@ -553,7 +590,23 @@ def render_html(model: ReportModel) -> str:
         parts.append("<p><i>No specific recommendations.</i></p>")
 
     # 11
-    parts.append("<h2>11. Appendix</h2><div class='card'><table>")
+    parts.append("<h2>11. Attack Chain</h2>")
+    if model.attack_chain:
+        for step in model.attack_chain:
+            parts.append("<div class='card'>")
+            parts.append(f"<h3>Step {step.step}: {_esc(step.title)}</h3>")
+            parts.append(f"<p><b>Confidence:</b> {_esc(step.confidence)}</p>")
+            parts.append(f"<p><b>Description:</b> {_esc(step.description)}</p>")
+            if step.evidence:
+                parts.append("<ul>" + "".join(f"<li>{_esc(ev)}</li>" for ev in step.evidence) + "</ul>")
+            if step.mitre:
+                parts.append(f"<p><b>MITRE ATT&amp;CK:</b> {_esc(', '.join(step.mitre))}</p>")
+            parts.append("</div>")
+    else:
+        parts.append("<p><i>No attack chain reconstructed from static evidence.</i></p>")
+
+    # 12
+    parts.append("<h2>12. Appendix</h2><div class='card'><table>")
     parts.append(f"<tr><th>Analysis Timestamp</th><td>{_esc(ap.analysis_timestamp)}</td></tr>")
     parts.append(f"<tr><th>Tool Version</th><td>{_esc(ap.tool_version)}</td></tr>")
     parts.append(f"<tr><th>Parsers Used</th><td>{_esc(', '.join(ap.parser_info) or 'None')}</td></tr>")

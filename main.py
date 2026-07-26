@@ -957,12 +957,11 @@ def main() -> None:
     # ATTACK CHAIN — saved alongside the reports
     # ==========================================
     #
-    # modules.report.model.build_report_model() does not currently have
-    # a dedicated Attack Chain section (see modules/report/model.py),
-    # so — without redesigning that schema — the reconstructed chain is
-    # additionally persisted as its own JSON artifact next to the other
-    # generated reports, using the exact dict reconstruct_attack_chain()
-    # already returned.
+    # The attack chain is now included in every report format via the
+    # Professional Report Engine (see modules/report/model.py). The
+    # separate JSON file is preserved as a standalone artifact alongside
+    # the other generated reports so consumers that already rely on it
+    # are unaffected.
 
     from datetime import datetime
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -991,6 +990,7 @@ def main() -> None:
             analysis=analysis,
             evidence_graph=evidence_graph,
             correlation_result=correlation_result,
+            attack_chain_result=attack_chain_result,
             output_dir=reports_dir,
             formats=args.formats,
         )

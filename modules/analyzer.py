@@ -1,12 +1,12 @@
 # modules/analyzer.py
 """
-Threat-scoring engine and report generator for PDFUncover.
+Threat-scoring engine for PDFUncover.
 
 analyze_results() takes the raw metadata + embedded-object results and
 turns them into a scored, human/machine-readable verdict (Threat Level,
 Risk Score, Suspicious Findings, MITRE ATT&CK mapping, plus a richer
-per-category "Evidence Report"). generate_report() renders that verdict
-to both a .txt and a .json report on disk.
+per-category "Evidence Report"). Report rendering is handled exclusively
+by the Professional Report Engine (modules/report/).
 
 Nothing in this module performs new detection — it only interprets and
 scores results that modules/embedded_extraction.py (and its parsers)
@@ -51,12 +51,10 @@ fallback (`legacy_score`) used solely if the Evidence Report cannot be
 built for some reason; they no longer drive Risk Score directly.
 """
 
-import json
 import logging
 import math
 import os
 import re
-from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from modules.parsers.evidence import (
@@ -1233,216 +1231,3 @@ def analyze_results(
     analysis["MITRE ATT&CK"]        = mitre_techniques
 
     return analysis
-
-
-# ==========================================
-# REPORT GENERATOR
-# ==========================================
-
-def generate_report(
-    pdf_path: str,
-    metadata: Dict[str, Any],
-    embedded_results: Dict[str, Any],
-    analysis: Dict[str, Any],
-) -> Optional[str]:
-    """
-    Generate both a human-readable .txt report and a
-    machine-readable .json report. Returns the txt report path,
-    or None if the reports directory/txt file could not be written.
-    """
-
-    try:
-        os.makedirs("output/reports", exist_ok=True)
-    except OSError as e:
-        log.error(f"Could not create reports directory: {e}")
-        return None
-
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    txt_path  = os.path.join("output/reports", f"report_{timestamp}.txt")
-    json_path = os.path.join("output/reports", f"report_{timestamp}.json")
-
-    # ==========================================
-    # JSON REPORT
-    # ==========================================
-
-    try:
-
-        json_report = {
-            "generated":        datetime.now().isoformat(),
-            "target":           pdf_path,
-            "threat_level":     analysis.get("Threat Level"),
-            "risk_score":       analysis.get("Risk Score"),
-            "mitre_techniques": analysis.get("MITRE ATT&CK", []),
-            "findings":         analysis.get("Suspicious Findings", []),
-            "metadata":         {
-                k: v for k, v in metadata.items()
-                if k != "Suspicious Flags"
-            },
-            "iocs": {
-                "urls":    safe_get(embedded_results, "IOCs", "URLs",    default=[]),
-                "domains": safe_get(embedded_results, "IOCs", "Domains", default=[]),
-                "ips":     safe_get(embedded_results, "IOCs", "IPs",     default=[])
-            },
-            "embedded_files": safe_get(
-                embedded_results, "Embedded Files", "Extracted Files", default=[]
-            )
-        }
-
-        with open(json_path, "w", encoding="utf-8") as jf:
-            json.dump(json_report, jf, indent=2, default=str)
-
-    except OSError as e:
-        log.error(f"Failed to write JSON report: {e}")
-
-    # ==========================================
-    # TXT REPORT
-    # ==========================================
-
-    sep  = "=" * 62
-    thin = "-" * 62
-
-    try:
-
-        with open(txt_path, "w", encoding="utf-8") as r:
-
-            def w(line: str = "") -> None:
-                r.write(line + "\n")
-
-            w(sep)
-            w("  PDF MALWARE ANALYSIS REPORT")
-            w(sep)
-            w(f"  Generated  : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-            w(f"  Target     : {pdf_path}")
-            w(f"  MD5        : {metadata.get('MD5', 'N/A')}")
-            w(f"  SHA256     : {metadata.get('SHA256', 'N/A')}")
-            w()
-
-            # VERDICT
-            w(sep)
-            w("  VERDICT")
-            w(sep)
-            threat = analysis.get("Threat Level", "UNKNOWN")
-            score  = analysis.get("Risk Score", 0)
-            w(f"  Threat Level : {threat}")
-            w(f"  Risk Score   : {score}/100")
-            w()
-
-            # MITRE ATT&CK
-            mitre = analysis.get("MITRE ATT&CK", [])
-
-            if mitre:
-                w(sep)
-                w("  MITRE ATT&CK TECHNIQUES")
-                w(sep)
-                for technique in mitre:
-                    w(f"  [*] {technique}")
-                w()
-
-            # SUSPICIOUS FINDINGS
-            findings = analysis.get("Suspicious Findings", [])
-
-            if findings:
-                w(sep)
-                w("  SUSPICIOUS FINDINGS")
-                w(sep)
-                for finding in findings:
-                    w(f"  [!] {finding}")
-                w()
-
-            # METADATA
-            w(sep)
-            w("  METADATA")
-            w(sep)
-
-            meta_fields = [
-                "File Name", "File Size", "Pages",
-                "Title", "Author", "Creator", "Producer",
-                "CreationDate", "ModDate", "PDF version",
-                "Encrypted", "JavaScript", "Linearized"
-            ]
-
-            for field in meta_fields:
-                if field in metadata:
-                    w(f"  {field:<18}: {metadata[field]}")
-            w()
-
-            # HASHES
-            w(sep)
-            w("  HASHES")
-            w(sep)
-            w(f"  MD5    : {metadata.get('MD5',    'N/A')}")
-            w(f"  SHA1   : {metadata.get('SHA1',   'N/A')}")
-            w(f"  SHA256 : {metadata.get('SHA256', 'N/A')}")
-            w()
-
-            # IOCs
-            urls    = safe_get(embedded_results, "IOCs", "URLs",    default=[])
-            domains = safe_get(embedded_results, "IOCs", "Domains", default=[])
-            ips     = safe_get(embedded_results, "IOCs", "IPs",     default=[])
-
-            if urls or domains or ips:
-                w(sep)
-                w("  INDICATORS OF COMPROMISE")
-                w(sep)
-                for url    in urls:    w(f"  URL    : {url}")
-                for domain in domains: w(f"  DOMAIN : {domain}")
-                for ip     in ips:     w(f"  IP     : {ip}")
-                w()
-
-            # EMBEDDED FILES
-            extracted = safe_get(
-                embedded_results, "Embedded Files", "Extracted Files", default=[]
-            )
-
-            if extracted:
-                w(sep)
-                w("  EMBEDDED FILES")
-                w(sep)
-                for f_path in extracted:
-                    w(f"  EXTRACTED : {f_path}")
-                w()
-
-            # STREAM ANALYSIS
-            high_entropy = safe_get(
-                embedded_results, "Streams", "High Entropy Streams", default=[]
-            )
-            shellcode = safe_get(
-                embedded_results, "Streams", "Decompressed Findings", default=[]
-            )
-
-            if high_entropy or shellcode:
-                w(sep)
-                w("  STREAM ANALYSIS")
-                w(sep)
-                for s in high_entropy: w(f"  [HIGH ENTROPY] {s}")
-                for s in shellcode:    w(f"  [SHELLCODE]    {s}")
-                w()
-
-            # MITIGATION
-            w(sep)
-            w("  MITIGATION RECOMMENDATIONS")
-            w(sep)
-
-            recommendations = [
-                "Do not open suspicious PDFs directly",
-                "Disable JavaScript in PDF reader settings",
-                "Open untrusted files in an isolated sandbox",
-                "Scan extracted payloads with AV / YARA rules",
-                "Block identified domains and IPs at the firewall",
-                "Submit file hash to VirusTotal for multi-engine scan",
-                "Patch PDF reader to latest version"
-            ]
-
-            for rec in recommendations:
-                w(f"  - {rec}")
-            w()
-
-            w(sep)
-            w(f"  Report also saved as JSON: {json_path}")
-            w(sep)
-
-    except OSError as e:
-        log.error(f"Failed to write TXT report: {e}")
-        return None
-
-    return txt_path

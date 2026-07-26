@@ -11,8 +11,8 @@ This module performs no detection/scoring of its own — see the
 module docstrings in model.py and renderers.py for the same guarantee.
 
 This is additive: it does not replace or alter
-modules.analyzer.generate_report(), which remains available for
-backward compatibility with any existing caller/report format.
+modules.attack_chain.reconstruct_attack_chain(); pass its result in
+via attack_chain_result to include the chain in every report format.
 """
 
 import logging
@@ -58,6 +58,7 @@ def generate_professional_report(
     analysis: Dict[str, Any],
     evidence_graph: Optional[Dict[str, Any]] = None,
     correlation_result: Optional[Dict[str, Any]] = None,
+    attack_chain_result: Optional[Dict[str, Any]] = None,
     output_dir: str = "output/reports",
     formats: Optional[List[str]] = None,
 ) -> Dict[str, str]:
@@ -71,6 +72,7 @@ def generate_professional_report(
         analysis: modules.analyzer.analyze_results() output.
         evidence_graph: optional modules.evidence_explorer.build_evidence_graph() output.
         correlation_result: optional modules.correlation.ThreatCorrelationEngine().correlate() output.
+        attack_chain_result: optional modules.attack_chain.reconstruct_attack_chain() output.
         output_dir: directory reports are written to.
         formats: subset of ("json", "markdown", "html", "text"); defaults to all four.
 
@@ -97,6 +99,7 @@ def generate_professional_report(
             analysis=analysis,
             evidence_graph=evidence_graph,
             correlation_result=correlation_result,
+            attack_chain_result=attack_chain_result,
         )
     except Exception as e:
         log.error(f"Failed to build report model: {e}")

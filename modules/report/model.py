@@ -132,6 +132,18 @@ class CorrelatedFinding:
 
 
 @dataclass
+class AttackChainStep:
+    """One step in the reconstructed attack chain, copied verbatim from
+    modules.attack_chain.reconstruct_attack_chain() output."""
+    step: int = 0
+    title: str = ""
+    description: str = ""
+    evidence: List[str] = field(default_factory=list)
+    confidence: str = "Low"
+    mitre: List[str] = field(default_factory=list)
+
+
+@dataclass
 class EvidenceTreeNode:
     id: str
     type: str
@@ -200,6 +212,7 @@ class ReportModel:
     network_indicators: NetworkIndicators = field(default_factory=NetworkIndicators)
     mitre_mappings: List[MitreEntry] = field(default_factory=list)
     recommendations: List[str] = field(default_factory=list)
+    attack_chain: List[AttackChainStep] = field(default_factory=list)
     appendix: Appendix = field(default_factory=Appendix)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -532,8 +545,6 @@ def _build_threat_intelligence(embedded_results: Dict[str, Any]) -> List[ThreatI
 
     return entries
 
-    return entries
-
 
 def _build_correlated_findings(
     analysis: Dict[str, Any],
@@ -790,6 +801,32 @@ def _build_recommendations(
     return recs
 
 
+def _build_attack_chain(
+    attack_chain_result: Optional[Dict[str, Any]],
+) -> List[AttackChainStep]:
+    """
+    Convert reconstruct_attack_chain() output into a list of typed
+    AttackChainStep objects. Copies every field verbatim from the dict
+    that attack_chain.py already produced — no new analysis here.
+    Returns an empty list when no chain was reconstructed or the
+    caller did not supply the result.
+    """
+
+    steps = []
+
+    for raw in (attack_chain_result or {}).get("Attack Chain", []) or []:
+        steps.append(AttackChainStep(
+            step=raw.get("step", 0),
+            title=raw.get("title", ""),
+            description=raw.get("description", ""),
+            evidence=list(raw.get("evidence", []) or []),
+            confidence=raw.get("confidence", "Low"),
+            mitre=list(raw.get("mitre", []) or []),
+        ))
+
+    return steps
+
+
 def _build_appendix(
     metadata: Dict[str, Any],
     embedded_results: Dict[str, Any],
@@ -831,6 +868,7 @@ def build_report_model(
     analysis: Dict[str, Any],
     evidence_graph: Optional[Dict[str, Any]] = None,
     correlation_result: Optional[Dict[str, Any]] = None,
+    attack_chain_result: Optional[Dict[str, Any]] = None,
 ) -> ReportModel:
     """
     Build the single Report Model every renderer consumes.
@@ -840,12 +878,14 @@ def build_report_model(
     model rather than an exception. This function performs no new
     detection/scoring — it only reorganizes results already produced
     by modules.metadata, modules.embedded_extraction, modules.analyzer,
-    modules.evidence_explorer, and (optionally) modules.correlation.
+    modules.evidence_explorer, modules.attack_chain, and (optionally)
+    modules.correlation.
     """
 
     metadata = metadata or {}
     embedded_results = embedded_results or {}
     analysis = analysis or {}
+    attack_chain_result = attack_chain_result or {}
 
     correlated_findings = _build_correlated_findings(analysis, correlation_result)
     network = _build_network_indicators(embedded_results)
@@ -865,5 +905,6 @@ def build_report_model(
         recommendations=_build_recommendations(
             analysis, correlated_findings, network, embedded_files
         ),
+        attack_chain=_build_attack_chain(attack_chain_result),
         appendix=_build_appendix(metadata, embedded_results),
     )
