@@ -13,28 +13,51 @@ domains and IPs only, so no stub methods exist for URL/Hash —
 unsupported types are expressed purely through
 ProviderRegistration.supported_types.
 
-Raw RDAP JSON never leaves this module — every field is normalized
-into ThreatIntelResult / DomainContext / IPContext before being
-returned.
-
-DomainContext has dedicated fields only for registrar and
-creation_date. Registration Authority and Entity/Organization have no
+DOMAIN LOOKUPS (unchanged): raw RDAP JSON is fetched directly from the
+rdap.org bootstrap service via `requests` and normalized by hand, same
+as before. DomainContext has dedicated fields only for registrar and
+creation_date; Registration Authority and Entity/Organization have no
 dedicated field, so — following the same convention already
 established by the WHOIS provider — they are appended into
 DomainContext.dns_records as labeled entries.
 
+IP LOOKUPS (migrated to `ipwhois`): this provider no longer issues its
+own bootstrap HTTP request for IPs. It now uses the `ipwhois` library
+(IPWhois(ip).lookup_rdap()), which already handles RDAP bootstrap
+resolution, redirects/referrals, retries, and response parsing
+internally — the manual HTTP + status-code handling this module used
+to do for IPs is no longer needed and has been removed. Only the
+mapping from ipwhois's already-parsed result dict onto this codebase's
+IPContext model remains here.
+
 IPContext has dedicated fields for organization, asn, country, and
-network. CIDR is the primary value for `network`. Network Name,
-Network Handle, and Registry have no dedicated field, and (unlike
-DomainContext) IPContext has no list field to absorb overflow into —
-so they are appended onto that same `network` string as a labeled
-parenthetical, the closest available convention.
+network. CIDR is the primary value for `network`. Network Name and
+Network Handle have no dedicated field, so they are appended onto that
+same `network` string as a labeled parenthetical, the closest
+available convention (unchanged from the previous implementation).
+
+Raw RDAP/ipwhois data never leaves this module — every field is
+normalized into ThreatIntelResult / DomainContext / IPContext before
+being returned.
 """
 
-import logging
+
 import os
 
 import requests
+
+from ipwhois import IPWhois
+from ipwhois.exceptions import (
+    IPDefinedError,
+    ASNRegistryError,
+    ASNParseError,
+    ASNLookupError,
+    HTTPLookupError,
+    HTTPRateLimitError,
+    WhoisLookupError,
+    WhoisRateLimitError,
+    RDAPLookupError,
+)
 
 from modules.threat_intel.models import (
     Ioc,
@@ -45,61 +68,15 @@ from modules.threat_intel.models import (
     IPContext,
     LookupError,
 )
-
-os.makedirs("logs", exist_ok=True)
-logging.basicConfig(
-    filename="logs/threat_intel.log",
-    level=logging.ERROR,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
-log = logging.getLogger(__name__)
+from modules.threat_intel.providers.helpers import http_get_json
+# logging is configured in modules/logging_config.py, not here
+from modules.logging_config import get_logger
+log = get_logger(__name__, "analyzer.log")
 
 PROVIDER_NAME = "RDAP"
 
 _BOOTSTRAP_URL = "https://rdap.org"
 _TIMEOUT = 20
-
-
-# ==========================================
-# HTTP HELPER
-# ==========================================
-
-def _request(url):
-    """
-    Perform a single RDAP bootstrap GET request.
-    Returns (json_dict, LookupError) — exactly one of the two is None.
-    """
-
-    try:
-        r = requests.get(
-            url, headers={"Accept": "application/rdap+json"}, timeout=_TIMEOUT
-        )
-
-    except requests.exceptions.Timeout:
-        return None, LookupError.NETWORK_ERROR
-
-    except requests.exceptions.RequestException as e:
-        log.error(f"RDAP request failed: {e}")
-        return None, LookupError.NETWORK_ERROR
-
-    if r.status_code == 404:
-        return None, LookupError.NOT_FOUND
-
-    if r.status_code in (401, 403):
-        return None, LookupError.AUTH_ERROR
-
-    if r.status_code == 429:
-        return None, LookupError.RATE_LIMITED
-
-    if r.status_code >= 400:
-        return None, LookupError.UNKNOWN
-
-    try:
-        return r.json(), None
-
-    except ValueError as e:
-        log.error(f"RDAP response JSON parse failed: {e}")
-        return None, LookupError.PARSE_ERROR
 
 
 # ==========================================
@@ -114,7 +91,7 @@ def _first_present(*values):
 
 
 # ==========================================
-# DOMAIN NORMALIZATION (IETF RDAP domain schema)
+# DOMAIN NORMALIZATION (IETF RDAP domain schema) — unchanged
 # ==========================================
 
 def _vcard_fn(vcard_array):
@@ -188,10 +165,27 @@ def _build_domain_context(data):
 
 
 # ==========================================
-# IP NORMALIZATION (RIR-style RDAP network schema)
+# IP NORMALIZATION (ipwhois-backed)
 # ==========================================
+#
+# IPWhois(ip).lookup_rdap() already resolves the correct RIR, follows
+# referrals, and returns a fully-parsed dict — this only maps that
+# dict's fields onto IPContext. Shape (top-level 'asn'/'asn_cidr'/
+# 'asn_country_code'/'asn_description'/'asn_registry' plus a nested
+# 'network' dict, 'entities' list, and 'objects' dict keyed by entity
+# handle) mirrors the raw IETF RDAP network schema this module already
+# understood, so the extraction logic below is intentionally close to
+# the previous bootstrap-based version — only the fields ipwhois
+# doesn't provide (e.g. the old 'autnums' / 'cidr0_cidrs' bootstrap-
+# specific fallbacks) have been dropped as unnecessary.
 
 def _extract_organization(data, network):
+    """
+    Prefer a contact name from one of the RDAP entities ipwhois already
+    parsed into data['objects']; fall back to the network's own name or
+    the ASN's description line.
+    """
+
     objects = data.get("objects") or {}
     entity_ids = data.get("entities") or []
 
@@ -206,19 +200,17 @@ def _extract_organization(data, network):
 
 
 def _extract_cidr(data, network):
-    return _first_present(
-        network.get("cidr"),
-        data.get("asn_cidr"),
-        network.get("cidr0_cidrs", [{}])[0].get("v4prefix")
-        if network.get("cidr0_cidrs") else None,
-    )
+    """CIDR from the network block, falling back to the ASN-level CIDR
+    ipwhois also surfaces at the top level."""
+
+    return _first_present(network.get("cidr"), data.get("asn_cidr"))
 
 
 def _build_ip_context(data):
     network = data.get("network") or {}
 
     organization = _extract_organization(data, network)
-    asn = _first_present(data.get("asn"), str(data.get("autnums")) if data.get("autnums") else None)
+    asn = _first_present(data.get("asn"), data.get("asn_description"))
     country = _first_present(network.get("country"), data.get("asn_country_code"))
     registry = data.get("asn_registry")
 
@@ -256,11 +248,16 @@ def _build_ip_context(data):
 # ==========================================
 
 def lookup_domain(domain):
-    """Look up a domain's RDAP registration facts."""
+    """Look up a domain's RDAP registration facts. Unchanged: still
+    queries the rdap.org bootstrap service directly via `requests`."""
 
     ioc = Ioc(value=domain, type=IocType.DOMAIN)
 
-    data, err = _request(f"{_BOOTSTRAP_URL}/domain/{domain}")
+    headers = {"Accept": "application/rdap+json"}
+    data, err = http_get_json(
+        f"{_BOOTSTRAP_URL}/domain/{domain}", headers=headers, timeout=_TIMEOUT,
+        provider_name=PROVIDER_NAME
+    )
     if err:
         return ProviderResult(provider=PROVIDER_NAME, ioc=ioc, success=False, error=err)
 
@@ -278,26 +275,76 @@ def lookup_domain(domain):
 
 
 # ==========================================
-# IP
+# IP (now backed by the ipwhois library)
 # ==========================================
 
 def lookup_ip(ip):
-    """Look up an IP's RDAP network/organization facts."""
+    """
+    Look up an IP's RDAP network/organization facts via the `ipwhois`
+    library instead of a hand-rolled RDAP bootstrap request.
+
+    Signature is unchanged (single `ip` positional argument, no API
+    key — RDAP/ipwhois needs none) so the ProviderRegistration in
+    modules/threat_intel/engine.py and every existing call site keep
+    working without modification.
+    """
 
     ioc = Ioc(value=ip, type=IocType.IP)
 
-    data, err = _request(f"{_BOOTSTRAP_URL}/ip/{ip}")
-    if err:
-        return ProviderResult(provider=PROVIDER_NAME, ioc=ioc, success=False, error=err)
+    try:
+        obj = IPWhois(ip)
+        result = obj.lookup_rdap(depth=1)
+
+    except IPDefinedError as e:
+        # Private/reserved/special-use address (RFC 1918, loopback,
+        # link-local, etc.) — there is no public RDAP record to find,
+        # which is a "not found" outcome rather than a lookup failure.
+        log.error(f"RDAP IP lookup skipped for {ip} (private/reserved address): {e}")
+        return ProviderResult(
+            provider=PROVIDER_NAME, ioc=ioc, success=False,
+            error=LookupError.NOT_FOUND, error_message=str(e),
+        )
+
+    except (HTTPRateLimitError, WhoisRateLimitError) as e:
+        log.error(f"RDAP IP lookup rate-limited for {ip}: {e}")
+        return ProviderResult(
+            provider=PROVIDER_NAME, ioc=ioc, success=False,
+            error=LookupError.RATE_LIMITED, error_message=str(e),
+        )
+
+    except (HTTPLookupError, WhoisLookupError, ASNLookupError) as e:
+        log.error(f"RDAP IP network lookup failed for {ip}: {e}")
+        return ProviderResult(
+            provider=PROVIDER_NAME, ioc=ioc, success=False,
+            error=LookupError.NETWORK_ERROR, error_message=str(e),
+        )
+
+    except (ASNRegistryError, ASNParseError, RDAPLookupError) as e:
+        log.error(f"RDAP IP lookup/parse failed for {ip}: {e}")
+        return ProviderResult(
+            provider=PROVIDER_NAME, ioc=ioc, success=False,
+            error=LookupError.PARSE_ERROR, error_message=str(e),
+        )
+
+    except Exception as e:
+        # Anything ipwhois itself doesn't classify (unexpected/library
+        # internal errors) — never let one bad lookup take down the
+        # rest of enrichment.
+        log.error(f"Unexpected RDAP IP lookup error for {ip}: {e}")
+        return ProviderResult(
+            provider=PROVIDER_NAME, ioc=ioc, success=False,
+            error=LookupError.UNKNOWN, error_message=str(e),
+        )
 
     try:
-        ip_context = _build_ip_context(data)
+        ip_context = _build_ip_context(result)
 
     except Exception as e:
         log.error(f"RDAP IP response parsing failed for {ip}: {e}")
         return ProviderResult(
-            provider=PROVIDER_NAME, ioc=ioc, success=False, error=LookupError.PARSE_ERROR
+            provider=PROVIDER_NAME, ioc=ioc, success=False,
+            error=LookupError.PARSE_ERROR, error_message=str(e),
         )
 
-    result = ThreatIntelResult(ioc=ioc, ip_context=ip_context)
-    return ProviderResult(provider=PROVIDER_NAME, ioc=ioc, success=True, data=result)
+    threat_intel_result = ThreatIntelResult(ioc=ioc, ip_context=ip_context)
+    return ProviderResult(provider=PROVIDER_NAME, ioc=ioc, success=True, data=threat_intel_result)

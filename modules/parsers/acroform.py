@@ -5,26 +5,12 @@
 # Moved verbatim from the "ACROFORM / AA DETECTION" section of the
 # former extract_embedded_objects() — no logic changed.
 
-import os
 import shutil
-import logging
 
 from modules.parsers.helpers import run_command
+from modules.logging_config import get_logger
 
-
-# ==========================================
-# LOGGING SETUP
-# ==========================================
-
-os.makedirs("logs", exist_ok=True)
-
-logging.basicConfig(
-    filename="logs/embedded_extraction.log",
-    level=logging.ERROR,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
-
-log = logging.getLogger(__name__)
+log = get_logger(__name__, "logs/embedded_extraction.log")
 
 
 def analyze_acroform(pdf_path):

@@ -27,7 +27,6 @@ A pulse count of zero still produces a successful ProviderResult with
 an empty ReputationFinding — never an error.
 """
 
-import logging
 import os
 from urllib.parse import quote
 
@@ -41,14 +40,13 @@ from modules.threat_intel.models import (
     ReputationFinding,
     LookupError,
 )
-
-os.makedirs("logs", exist_ok=True)
-logging.basicConfig(
-    filename="logs/threat_intel.log",
-    level=logging.ERROR,
-    format="%(asctime)s [%(levelname)s] %(message)s"
+from modules.threat_intel.providers.helpers import (
+    make_api_key_header,
+    http_get_json,
 )
-log = logging.getLogger(__name__)
+
+from modules.logging_config import get_logger
+log = get_logger(__name__, "analyzer.log")
 
 PROVIDER_NAME = "AlienVault OTX"
 
@@ -62,50 +60,6 @@ _HONEYPOT_TAGS = {
     "honeypot", "tpot", "dionaea", "cowrie", "honeytrap",
     "suricata", "mailoney", "tanner", "sentrypeer", "fatt", "p0f",
 }
-
-
-# ==========================================
-# HTTP HELPER
-# ==========================================
-
-def _headers(api_key):
-    return {"X-OTX-API-KEY": api_key} if api_key else {}
-
-
-def _request(url, api_key):
-    """
-    Perform a single OTX API GET request.
-    Returns (json_dict, LookupError) — exactly one of the two is None.
-    """
-
-    try:
-        r = requests.get(url, headers=_headers(api_key), timeout=_TIMEOUT)
-
-    except requests.exceptions.Timeout:
-        return None, LookupError.NETWORK_ERROR
-
-    except requests.exceptions.RequestException as e:
-        log.error(f"OTX request failed: {e}")
-        return None, LookupError.NETWORK_ERROR
-
-    if r.status_code == 404:
-        return None, LookupError.NOT_FOUND
-
-    if r.status_code in (401, 403):
-        return None, LookupError.AUTH_ERROR
-
-    if r.status_code == 429:
-        return None, LookupError.RATE_LIMITED
-
-    if r.status_code >= 400:
-        return None, LookupError.UNKNOWN
-
-    try:
-        return r.json(), None
-
-    except ValueError as e:
-        log.error(f"OTX response JSON parse failed: {e}")
-        return None, LookupError.PARSE_ERROR
 
 
 # ==========================================
@@ -190,7 +144,12 @@ def lookup_url(url, api_key):
     ioc = Ioc(value=url, type=IocType.URL)
     encoded = quote(url, safe="")
 
-    data, err = _request(f"{_BASE_URL}/url/{encoded}/general", api_key)
+    headers = make_api_key_header(api_key, "X-OTX-API-KEY")
+
+    data, err = http_get_json(
+        f"{_BASE_URL}/url/{encoded}/general", headers=headers, timeout=_TIMEOUT,
+        provider_name=PROVIDER_NAME
+    )
     if err:
         return ProviderResult(provider=PROVIDER_NAME, ioc=ioc, success=False, error=err)
 
@@ -217,7 +176,12 @@ def lookup_domain(domain, api_key):
 
     ioc = Ioc(value=domain, type=IocType.DOMAIN)
 
-    data, err = _request(f"{_BASE_URL}/domain/{domain}/general", api_key)
+    headers = make_api_key_header(api_key, "X-OTX-API-KEY")
+
+    data, err = http_get_json(
+        f"{_BASE_URL}/domain/{domain}/general", headers=headers, timeout=_TIMEOUT,
+        provider_name=PROVIDER_NAME
+    )
     if err:
         return ProviderResult(provider=PROVIDER_NAME, ioc=ioc, success=False, error=err)
 
@@ -245,7 +209,12 @@ def lookup_ip(ip, api_key):
 
     ioc = Ioc(value=ip, type=IocType.IP)
 
-    data, err = _request(f"{_BASE_URL}/IPv4/{ip}/general", api_key)
+    headers = make_api_key_header(api_key, "X-OTX-API-KEY")
+
+    data, err = http_get_json(
+        f"{_BASE_URL}/IPv4/{ip}/general", headers=headers, timeout=_TIMEOUT,
+        provider_name=PROVIDER_NAME
+    )
     if err:
         return ProviderResult(provider=PROVIDER_NAME, ioc=ioc, success=False, error=err)
 
@@ -274,7 +243,12 @@ def lookup_hash(file_hash, api_key):
 
     ioc = Ioc(value=file_hash, type=IocType.HASH)
 
-    data, err = _request(f"{_BASE_URL}/file/{file_hash}/general", api_key)
+    headers = make_api_key_header(api_key, "X-OTX-API-KEY")
+
+    data, err = http_get_json(
+        f"{_BASE_URL}/file/{file_hash}/general", headers=headers, timeout=_TIMEOUT,
+        provider_name=PROVIDER_NAME
+    )
     if err:
         return ProviderResult(provider=PROVIDER_NAME, ioc=ioc, success=False, error=err)
 

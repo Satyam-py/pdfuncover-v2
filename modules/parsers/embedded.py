@@ -58,7 +58,6 @@
 import os
 import re
 import shutil
-import logging
 
 from modules.parsers.helpers import (
     run_command,
@@ -68,6 +67,8 @@ from modules.parsers.helpers import (
     find_balanced_parens_content,
     find_balanced_parens_bytes,
 )
+
+from modules.logging_config import get_logger
 
 
 # ==========================================
@@ -192,19 +193,7 @@ def _unescape_pdf_str(text):
     return "".join(out)
 
 
-# ==========================================
-# LOGGING SETUP
-# ==========================================
-
-os.makedirs("logs", exist_ok=True)
-
-logging.basicConfig(
-    filename="logs/embedded_extraction.log",
-    level=logging.ERROR,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
-
-log = logging.getLogger(__name__)
+log = get_logger(__name__, "logs/embedded_extraction.log")
 
 
 # ==========================================

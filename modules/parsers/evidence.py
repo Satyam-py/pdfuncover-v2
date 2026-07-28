@@ -11,22 +11,10 @@
 
 import os
 import re
-import logging
 
+from modules.logging_config import get_logger
 
-# ==========================================
-# LOGGING SETUP
-# ==========================================
-
-os.makedirs("logs", exist_ok=True)
-
-logging.basicConfig(
-    filename="logs/embedded_extraction.log",
-    level=logging.ERROR,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
-
-log = logging.getLogger(__name__)
+log = get_logger(__name__, "logs/embedded_extraction.log")
 
 
 # ==========================================
@@ -207,32 +195,14 @@ def build_evidence(
                 evidence=f"JavaScript calls {keyword}(), an API with a documented "
                          f"history of abuse in malicious PDFs.",
                 impact="Can be used to launch external content, exfiltrate form "
-                       "data, or trigger other exploit-chain behavior.",
-                recommendation=f"Locate every call to {keyword}() in the decoded "
-                                f"script and determine its target/arguments.",
-                mitre=["T1204.002"],
+                       "data, or trigger memory corruption in vulnerable readers.",
+                recommendation=f"Trace all uses of {keyword}() in the decoded "
+                               f"script and determine what it is called with.",
+                mitre=["T1059.007"],
                 tags=["javascript", "exploit-api"],
             ))
 
-    # ---------------- Streams / Entropy ----------------
-
-    for entry in stream_data.get("High Entropy Streams", []):
-        obj_match = re.match(r"Stream (\d+)", entry)
-        evidence.append(make_evidence(
-            id=f"stream.high_entropy.{obj_match.group(1) if obj_match else _slug(entry)}",
-            category="Stream Analysis",
-            title="High-Entropy Stream",
-            severity=SEVERITY_MEDIUM,
-            confidence=CONFIDENCE_MEDIUM,
-            evidence=entry,
-            impact="Entropy above 7.2 suggests encrypted, packed, or otherwise "
-                   "obfuscated content that may be concealing a payload.",
-            recommendation="Extract and manually inspect this stream; attempt "
-                            "decompression/decryption to reveal its true content.",
-            mitre=["T1027.002"],
-            obj=obj_match.group(0) if obj_match else None,
-            tags=["stream", "entropy"],
-        ))
+    # ---------------- Streams ----------------
 
     for entry in stream_data.get("Decompressed Findings", []):
         obj_match = re.match(r"Stream (\d+)", entry)

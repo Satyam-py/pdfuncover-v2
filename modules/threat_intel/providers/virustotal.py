@@ -9,7 +9,6 @@ ReputationFinding / *Context before being returned.
 """
 
 import base64
-import logging
 import os
 
 import requests
@@ -26,63 +25,18 @@ from modules.threat_intel.models import (
     UrlContext,
     LookupError,
 )
-
-os.makedirs("logs", exist_ok=True)
-logging.basicConfig(
-    filename="logs/threat_intel.log",
-    level=logging.ERROR,
-    format="%(asctime)s [%(levelname)s] %(message)s"
+from modules.threat_intel.providers.helpers import (
+    make_api_key_header,
+    http_get_json,
 )
-log = logging.getLogger(__name__)
+
+from modules.logging_config import get_logger
+log = get_logger(__name__, "analyzer.log")
 
 PROVIDER_NAME = "VirusTotal"
 
 _BASE_URL = "https://www.virustotal.com/api/v3"
 _TIMEOUT = 20
-
-
-# ==========================================
-# HTTP HELPER
-# ==========================================
-
-def _headers(api_key):
-    return {"x-apikey": api_key}
-
-
-def _request(url, api_key):
-    """
-    Perform a single VT API GET request.
-    Returns (json_dict, LookupError) — exactly one of the two is None.
-    """
-
-    try:
-        r = requests.get(url, headers=_headers(api_key), timeout=_TIMEOUT)
-
-    except requests.exceptions.Timeout:
-        return None, LookupError.NETWORK_ERROR
-
-    except requests.exceptions.RequestException as e:
-        log.error(f"VirusTotal request failed: {e}")
-        return None, LookupError.NETWORK_ERROR
-
-    if r.status_code == 404:
-        return None, LookupError.NOT_FOUND
-
-    if r.status_code == 401:
-        return None, LookupError.AUTH_ERROR
-
-    if r.status_code == 429:
-        return None, LookupError.RATE_LIMITED
-
-    if r.status_code >= 400:
-        return None, LookupError.UNKNOWN
-
-    try:
-        return r.json(), None
-
-    except ValueError as e:
-        log.error(f"VirusTotal response JSON parse failed: {e}")
-        return None, LookupError.PARSE_ERROR
 
 
 # ==========================================
@@ -137,7 +91,12 @@ def lookup_url(url, api_key):
     ioc = Ioc(value=url, type=IocType.URL)
     url_id = base64.urlsafe_b64encode(url.encode()).decode().strip("=")
 
-    data, err = _request(f"{_BASE_URL}/urls/{url_id}", api_key)
+    headers = make_api_key_header(api_key, "x-apikey")
+
+    data, err = http_get_json(
+        f"{_BASE_URL}/urls/{url_id}", headers=headers, timeout=_TIMEOUT,
+        provider_name=PROVIDER_NAME
+    )
     if err:
         return ProviderResult(provider=PROVIDER_NAME, ioc=ioc, success=False, error=err)
 
@@ -176,7 +135,12 @@ def lookup_domain(domain, api_key):
 
     ioc = Ioc(value=domain, type=IocType.DOMAIN)
 
-    data, err = _request(f"{_BASE_URL}/domains/{domain}", api_key)
+    headers = make_api_key_header(api_key, "x-apikey")
+
+    data, err = http_get_json(
+        f"{_BASE_URL}/domains/{domain}", headers=headers, timeout=_TIMEOUT,
+        provider_name=PROVIDER_NAME
+    )
     if err:
         return ProviderResult(provider=PROVIDER_NAME, ioc=ioc, success=False, error=err)
 
@@ -222,7 +186,12 @@ def lookup_ip(ip, api_key):
 
     ioc = Ioc(value=ip, type=IocType.IP)
 
-    data, err = _request(f"{_BASE_URL}/ip_addresses/{ip}", api_key)
+    headers = make_api_key_header(api_key, "x-apikey")
+
+    data, err = http_get_json(
+        f"{_BASE_URL}/ip_addresses/{ip}", headers=headers, timeout=_TIMEOUT,
+        provider_name=PROVIDER_NAME
+    )
     if err:
         return ProviderResult(provider=PROVIDER_NAME, ioc=ioc, success=False, error=err)
 
@@ -262,7 +231,12 @@ def lookup_hash(file_hash, api_key):
 
     ioc = Ioc(value=file_hash, type=IocType.HASH)
 
-    data, err = _request(f"{_BASE_URL}/files/{file_hash}", api_key)
+    headers = make_api_key_header(api_key, "x-apikey")
+
+    data, err = http_get_json(
+        f"{_BASE_URL}/files/{file_hash}", headers=headers, timeout=_TIMEOUT,
+        provider_name=PROVIDER_NAME
+    )
     if err:
         return ProviderResult(provider=PROVIDER_NAME, ioc=ioc, success=False, error=err)
 

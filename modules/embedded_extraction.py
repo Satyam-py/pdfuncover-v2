@@ -120,6 +120,44 @@ def extract_embedded_objects(pdf_path):
     # ==========================================
 
     ioc_data = extract_iocs(pdf_path, strings_output)
+    
+    # Ensure all IOC categories are present, even if empty
+    if "Hashes" not in ioc_data:
+        ioc_data["Hashes"] = []
+
+    # ==========================================
+    # EMBEDDED FILES
+    # ==========================================
+
+    embedded_data = extract_embedded_files(pdf_path)
+    results["Embedded Files"] = embedded_data
+
+    # ==========================================
+    # EMBEDDED FILE HASHES FOR THREAT INTELLIGENCE
+    # ==========================================
+    #
+    # If embedded files were extracted, calculate SHA256 for each and
+    # add to IOCs for threat intelligence lookup. This enriches the
+    # analysis by checking if extracted binaries are known-malicious.
+
+    if embedded_data.get("Extracted Files"):
+        import hashlib
+        
+        extracted_file_hashes = []
+        for file_path in embedded_data["Extracted Files"]:
+            try:
+                sha256_hash = hashlib.sha256()
+                with open(file_path, "rb") as f:
+                    for chunk in iter(lambda: f.read(4096), b""):
+                        sha256_hash.update(chunk)
+                file_hash = sha256_hash.hexdigest()
+                if file_hash not in extracted_file_hashes:
+                    extracted_file_hashes.append(file_hash)
+            except Exception as e:
+                log.error(f"Failed to calculate SHA256 for {file_path}: {e}")
+        
+        if extracted_file_hashes:
+            ioc_data["Hashes"].extend(extracted_file_hashes)
 
     # ==========================================
     # THREAT INTELLIGENCE ENRICHMENT (Step 9)
@@ -131,7 +169,7 @@ def extract_embedded_objects(pdf_path):
     # if no API keys are configured, there's no internet, or every
     # provider fails, ioc_data["Threat Intelligence"] simply comes
     # back with empty sub-dicts and analysis continues unaffected —
-    # extraction results ("URLs"/"Domains"/"IPs") are never altered by
+    # extraction results ("URLs"/"Domains"/"IPs"/"Hashes") are never altered by
     # this step.
 
     try:
@@ -140,17 +178,11 @@ def extract_embedded_objects(pdf_path):
     except Exception as e:
         log.error(f"Threat intelligence enrichment failed: {e}")
         ioc_data["Threat Intelligence"] = {
-            "URLs": {}, "Domains": {}, "IPs": {}, "_typed": {"URLs": {}, "Domains": {}, "IPs": {}}
+            "URLs": {}, "Domains": {}, "IPs": {}, "Hashes": {},
+            "_typed": {"URLs": {}, "Domains": {}, "IPs": {}, "Hashes": {}}
         }
 
     results["IOCs"] = ioc_data
-
-    # ==========================================
-    # EMBEDDED FILES
-    # ==========================================
-
-    embedded_data = extract_embedded_files(pdf_path)
-    results["Embedded Files"] = embedded_data
 
     # ==========================================
     # IMAGE EXTRACTION

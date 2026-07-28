@@ -1,27 +1,77 @@
-# modules/report/engine.py
+# modules/threat_intel/engine.py
 """
-Public entry point for the Professional Report Engine.
+Threat Intelligence Engine — frozen provider orchestration layer.
 
-generate_professional_report() builds the Report Model (see
-modules/report/model.py) from results that already exist elsewhere in
-the pipeline, then renders it to every requested output format via
-modules/report/renderers.py, writing each to disk.
+This module serves as the central orchestration point for all Threat
+Intelligence providers (VirusTotal, OTX, URLScan, AbuseIPDB, WHOIS, RDAP).
+It is called ONLY from modules/threat_intel_pipeline.py's enrich_ioc(),
+and ONLY to perform IOC enrichment — no detection logic, no scoring,
+just provider execution and result aggregation.
 
-This module performs no detection/scoring of its own — see the
-module docstrings in model.py and renderers.py for the same guarantee.
+The engine is FROZEN per Step 9 requirements:
+  - Provider registry (PROVIDERS) is defined here and never modified
+    after Step 9.
+  - No new providers are added after this file is created.
+  - No detection or filtering logic is added here.
+  - It performs only: provider dispatch, result aggregation, and
+    field-by-field context merging per modules/threat_intel/models.py
 
-This is additive: it does not replace or alter
-modules.attack_chain.reconstruct_attack_chain(); pass its result in
-via attack_chain_result to include the chain in every report format.
+Provider Selection:
+  - enrich_ioc() looks up ioc.type in PROVIDERS
+  - For each provider that supports ioc.type, the corresponding lookup
+    function is called with (ioc.value, api_key)
+  - Providers requiring an API key are skipped if the key is missing
+  - Providers without an API key (WHOIS, RDAP context providers) always run
+
+Result Aggregation:
+  - Every ProviderResult (success or failure) is preserved in the
+    provider_results list for per-provider detail visibility.
+  - Successful results are aggregated into a single ThreatIntelResult:
+    * ReputationFindings are accumulated in result.reputations[]
+    * Context objects (IP, Domain, URL, File) are merged per provider
+      order of appearance, with existing fields preserved and missing
+      fields filled in from new providers.
+  - Returns EnrichmentResult(ioc, result, provider_results)
+
+Import Note:
+  This module imports directly from provider modules (virustotal, otx,
+  urlscan, abuseipdb, whois, rdap), not from their subpackages. Files
+  in the actual deployment will be in modules/threat_intel/providers/*.py.
+  Imports are adjusted here to match the flat file structure during
+  development.
 """
 
 import logging
 import os
-from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from modules.report.model import build_report_model
-from modules.report.renderers import RENDERERS
+# Imports from the TI models and provider modules
+from modules.threat_intel.models import (
+    Ioc,
+    IocType,
+    ProviderResult,
+    ThreatIntelResult,
+    ReputationFinding,
+    EnrichmentResult,
+    DomainContext,
+    IPContext,
+    FileContext,
+    UrlContext,
+    merge_ip_context,
+    merge_domain_context,
+    merge_file_context,
+    merge_url_context,
+    ProviderRegistration,
+)
+
+from modules.threat_intel.providers import (
+    virustotal,
+    otx,
+    urlscan,
+    abuseipdb,
+    whois,
+    rdap,
+)
 
 
 # ==========================================
@@ -31,7 +81,7 @@ from modules.report.renderers import RENDERERS
 os.makedirs("logs", exist_ok=True)
 
 logging.basicConfig(
-    filename="logs/report.log",
+    filename="logs/threat_intel.log",
     level=logging.ERROR,
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
@@ -39,93 +89,235 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-DEFAULT_FORMATS = ("json", "markdown", "html", "text")
+# ==========================================
+# PROVIDER REGISTRY
+# ==========================================
+#
+# FROZEN per Step 9: this registry is defined once here and never
+# modified. No new providers are added after this point. Each
+# ProviderRegistration specifies:
+#   - name: human-readable provider name
+#   - supported_types: IOC types this provider handles (URL/Domain/IP/Hash)
+#   - lookups: dict mapping IocType -> lookup function
+#   - requires_api_key: whether an API key is mandatory
+#   - config_key: env var / config file key for the API key (if required)
 
-_EXTENSION_BY_FORMAT = {
-    "json": "json",
-    "markdown": "md",
-    "md": "md",
-    "html": "html",
-    "text": "txt",
-    "txt": "txt",
-}
+PROVIDERS: List[ProviderRegistration] = [
+    # ========================
+    # REPUTATION PROVIDERS
+    # ========================
+    # These return actual malice/suspicious/harmless vote counts and
+    # contribute to the final verdict score.
+    
+    ProviderRegistration(
+        name="VirusTotal",
+        supported_types=[IocType.URL, IocType.DOMAIN, IocType.IP, IocType.HASH],
+        lookups={
+            IocType.URL: virustotal.lookup_url,
+            IocType.DOMAIN: virustotal.lookup_domain,
+            IocType.IP: virustotal.lookup_ip,
+            IocType.HASH: virustotal.lookup_hash,
+        },
+        requires_api_key=True,
+        config_key="virustotal_api_key",
+    ),
+    
+    ProviderRegistration(
+        name="OTX",
+        supported_types=[IocType.URL, IocType.DOMAIN, IocType.IP, IocType.HASH],
+        lookups={
+            IocType.URL: otx.lookup_url,
+            IocType.DOMAIN: otx.lookup_domain,
+            IocType.IP: otx.lookup_ip,
+            IocType.HASH: otx.lookup_hash,
+        },
+        requires_api_key=True,
+        config_key="otx_api_key",
+    ),
+    
+    ProviderRegistration(
+        name="URLScan",
+        supported_types=[IocType.URL, IocType.DOMAIN, IocType.IP],
+        lookups={
+            IocType.URL: urlscan.lookup_url,
+            IocType.DOMAIN: urlscan.lookup_domain,
+            IocType.IP: urlscan.lookup_ip,
+        },
+        requires_api_key=False,  # URLScan allows unauthenticated searches
+        config_key=None,
+    ),
+    
+    ProviderRegistration(
+        name="AbuseIPDB",
+        supported_types=[IocType.IP],
+        lookups={
+            IocType.IP: abuseipdb.lookup_ip,
+        },
+        requires_api_key=True,
+        config_key="abuseipdb_api_key",
+    ),
+    
+    # ========================
+    # CONTEXT PROVIDERS
+    # ========================
+    # These do not return reputation verdicts, only enrichment context
+    # (registrar, ASN, etc.). They contribute to the EnrichmentResult
+    # but not to the verdict score.
+    
+    ProviderRegistration(
+        name="WHOIS",
+        supported_types=[IocType.DOMAIN],
+        lookups={
+            IocType.DOMAIN: whois.lookup_domain,
+        },
+        requires_api_key=False,
+        config_key=None,
+    ),
+    
+    ProviderRegistration(
+        name="RDAP",
+        supported_types=[IocType.DOMAIN, IocType.IP],
+        lookups={
+            IocType.DOMAIN: rdap.lookup_domain,
+            IocType.IP: rdap.lookup_ip,
+        },
+        requires_api_key=False,
+        config_key=None,
+    ),
+]
 
 
-def generate_professional_report(
-    pdf_path: str,
-    metadata: Dict[str, Any],
-    embedded_results: Dict[str, Any],
-    analysis: Dict[str, Any],
-    evidence_graph: Optional[Dict[str, Any]] = None,
-    correlation_result: Optional[Dict[str, Any]] = None,
-    attack_chain_result: Optional[Dict[str, Any]] = None,
-    output_dir: str = "output/reports",
-    formats: Optional[List[str]] = None,
-) -> Dict[str, str]:
+# ==========================================
+# AGGREGATION HELPERS
+# ==========================================
+
+def _merge_reputation_findings(findings: List[ReputationFinding]) -> List[ReputationFinding]:
     """
-    Build the Report Model and render it to every requested format.
+    Collect all successful ReputationFindings into the result's
+    reputations[] field. No deduplication or filtering — every
+    successful reputation provider's result is preserved.
+    """
+    return findings
+
+
+def _aggregate_result(
+    ioc: Ioc, provider_results: List[ProviderResult]
+) -> ThreatIntelResult:
+    """
+    Aggregate all ProviderResults (successful and failed) into a
+    single ThreatIntelResult by merging fields from successful lookups.
+    
+    Successful results contribute:
+      - Their ReputationFinding to result.reputations[]
+      - Their context (IP, Domain, URL, File) merged into result.*_context
+    
+    Failed results are simply preserved in provider_results for
+    per-provider visibility but do not affect the aggregated result.
+    """
+
+    reputations: List[ReputationFinding] = []
+    ip_context: Optional[IPContext] = None
+    domain_context: Optional[DomainContext] = None
+    url_context: Optional[UrlContext] = None
+    file_context: Optional[FileContext] = None
+
+    for pr in provider_results:
+        if not pr.success or pr.data is None:
+            continue
+
+        # Collect reputation findings from successful lookups
+        if pr.data.reputation is not None:
+            reputations.append(pr.data.reputation)
+
+        # Merge context objects (existing fields preserved, new fields filled in)
+        ip_context = merge_ip_context(ip_context, pr.data.ip_context)
+        domain_context = merge_domain_context(domain_context, pr.data.domain_context)
+        url_context = merge_url_context(url_context, pr.data.url_context)
+        file_context = merge_file_context(file_context, pr.data.file_context)
+
+    return ThreatIntelResult(
+        ioc=ioc,
+        reputation=None,  # Legacy field; reputations[] is the new interface
+        reputations=reputations,
+        ip_context=ip_context,
+        domain_context=domain_context,
+        url_context=url_context,
+        file_context=file_context,
+    )
+
+
+# ==========================================
+# PROVIDER EXECUTION
+# ==========================================
+
+def enrich_ioc(ioc: Ioc, config: Dict[str, Any]) -> EnrichmentResult:
+    """
+    Enrich one IOC by dispatching it to every provider that supports
+    its type, aggregating all results (success and failure) into a
+    single EnrichmentResult.
 
     Args:
-        pdf_path: path to the analyzed PDF.
-        metadata: modules.metadata.extract_metadata() output.
-        embedded_results: modules.embedded_extraction.extract_embedded_objects() output.
-        analysis: modules.analyzer.analyze_results() output.
-        evidence_graph: optional modules.evidence_explorer.build_evidence_graph() output.
-        correlation_result: optional modules.correlation.ThreatCorrelationEngine().correlate() output.
-        attack_chain_result: optional modules.attack_chain.reconstruct_attack_chain() output.
-        output_dir: directory reports are written to.
-        formats: subset of ("json", "markdown", "html", "text"); defaults to all four.
+        ioc: The (type, value) pair to enrich.
+        config: {config_key: api_key} dict as built by app_config.get_provider_config().
+                Missing keys mean no API key is available for that provider.
 
     Returns:
-        {format_name: file_path} for every format successfully written.
-        A format that fails to render/write is logged and simply
-        omitted from the result — one bad format never blocks the
-        others.
+        EnrichmentResult with:
+          - ioc: the input ioc
+          - result: aggregated ThreatIntelResult (reputations[], contexts)
+          - provider_results: full list of individual provider outcomes
+
+    Never raises. Providers that fail, timeout, or have no API key
+    simply produce a failed ProviderResult which is preserved but not
+    aggregated into result.
     """
 
-    formats = formats or list(DEFAULT_FORMATS)
+    provider_results: List[ProviderResult] = []
 
-    try:
-        os.makedirs(output_dir, exist_ok=True)
-    except OSError as e:
-        log.error(f"Could not create report output directory {output_dir}: {e}")
-        return {}
+    for provider_reg in PROVIDERS:
 
-    try:
-        model = build_report_model(
-            pdf_path=pdf_path,
-            metadata=metadata,
-            embedded_results=embedded_results,
-            analysis=analysis,
-            evidence_graph=evidence_graph,
-            correlation_result=correlation_result,
-            attack_chain_result=attack_chain_result,
-        )
-    except Exception as e:
-        log.error(f"Failed to build report model: {e}")
-        return {}
-
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    written: Dict[str, str] = {}
-
-    for fmt in formats:
-
-        renderer = RENDERERS.get(fmt)
-
-        if renderer is None:
-            log.error(f"Unknown report format requested: {fmt}")
+        # Skip if this provider doesn't support this IOC type
+        if not provider_reg.supports(ioc.type):
             continue
 
-        ext = _EXTENSION_BY_FORMAT.get(fmt, fmt)
-        out_path = os.path.join(output_dir, f"dfir_report_{timestamp}.{ext}")
+        # Skip if this provider requires an API key and we don't have it
+        if provider_reg.requires_api_key:
+            api_key = config.get(provider_reg.config_key)
+            if not api_key:
+                log.warning(
+                    f"Skipping {provider_reg.name}: no API key configured "
+                    f"({provider_reg.config_key})"
+                )
+                continue
+        else:
+            api_key = None
 
+        # Look up this IOC with this provider
         try:
-            content = renderer(model)
-            with open(out_path, "w", encoding="utf-8") as f:
-                f.write(content)
-            written[fmt] = out_path
-        except Exception as e:
-            log.error(f"Failed to render/write '{fmt}' report: {e}")
-            continue
+            lookup_fn = provider_reg.lookups[ioc.type]
+            result = lookup_fn(ioc.value, api_key)
+            provider_results.append(result)
 
-    return written
+        except Exception as e:
+            log.error(
+                f"Exception calling {provider_reg.name}.lookup_{ioc.type.value}(): {e}"
+            )
+            # Create a failed result to preserve the error in the output
+            provider_results.append(
+                ProviderResult(
+                    provider=provider_reg.name,
+                    ioc=ioc,
+                    success=False,
+                    error=None,
+                    error_message=str(e),
+                )
+            )
+
+    # Aggregate all successful results into a single ThreatIntelResult
+    aggregated = _aggregate_result(ioc, provider_results)
+
+    return EnrichmentResult(
+        ioc=ioc,
+        result=aggregated,
+        provider_results=provider_results,
+    )

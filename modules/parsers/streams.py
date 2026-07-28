@@ -34,7 +34,6 @@
 import os
 import re
 import shutil
-import logging
 
 from modules.parsers.helpers import (
     run_command,
@@ -49,15 +48,8 @@ from modules.parsers.helpers import (
 # LOGGING SETUP
 # ==========================================
 
-os.makedirs("logs", exist_ok=True)
-
-logging.basicConfig(
-    filename="logs/embedded_extraction.log",
-    level=logging.ERROR,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
-
-log = logging.getLogger(__name__)
+from modules.logging_config import get_logger
+log = get_logger(__name__, "logs/embedded_extraction.log")
 
 
 # ==========================================

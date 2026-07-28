@@ -54,6 +54,7 @@ data the caller may provide. That hashing is read-only, wrapped in
 try/except, and never raises.
 """
 
+import datetime
 import hashlib
 import logging
 import math
@@ -393,34 +394,87 @@ def _is_typosquat(domain: str) -> Optional[str]:
     return None
 
 
-def _looks_newly_registered(entry: Dict[str, Any]) -> bool:
+def _looks_newly_registered(threat_intelligence: Dict[str, Any], ioc_value: str) -> bool:
     """
-    Best-effort check of a TI entry's raw provider data for a
-    domain-age signal. Different providers surface this under
-    different keys (or not at all); this only fires when something
-    unambiguous is found, never guessed.
+    Best-effort check of a domain's TI data for a domain-age signal.
+    Reads creation_date from the typed EnrichmentResult's DomainContext,
+    which is where WHOIS, RDAP, and VirusTotal all store it after
+    normalisation. Falls back to the legacy flat entry's providers dict
+    for any pre-typed data. Returns True only when a creation date is
+    found and falls within _NEWLY_REGISTERED_DAYS_THRESHOLD days of now.
     """
 
-    for provider_name, provider_detail in (entry.get("providers") or {}).items():
+    # --- Typed path (primary): DomainContext.creation_date ---
+    typed_block = (threat_intelligence or {}).get("_typed") or {}
+    typed_domains = typed_block.get("Domains") if isinstance(typed_block, dict) else None
+    if isinstance(typed_domains, dict):
+        enrichment = typed_domains.get(ioc_value)
+        if enrichment is not None:
+            result = getattr(enrichment, "result", None)
+            domain_ctx = getattr(result, "domain_context", None) if result is not None else None
+            creation_date_str = getattr(domain_ctx, "creation_date", None) if domain_ctx is not None else None
+            if creation_date_str:
+                age_days = _parse_creation_date_to_age_days(str(creation_date_str))
+                if age_days is not None and age_days <= _NEWLY_REGISTERED_DAYS_THRESHOLD:
+                    return True
 
-        raw = provider_detail.get("raw") if isinstance(provider_detail, dict) else None
-        if not isinstance(raw, dict):
-            continue
-
-        for key in _DOMAIN_AGE_RAW_KEYS:
-            if key not in raw:
+    # --- Legacy path (fallback): entry["providers"][name]["raw"] ---
+    legacy_domains = (threat_intelligence or {}).get("Domains") or {}
+    entry = legacy_domains.get(ioc_value) if isinstance(legacy_domains, dict) else None
+    if isinstance(entry, dict):
+        for provider_name, provider_detail in (entry.get("providers") or {}).items():
+            raw = provider_detail.get("raw") if isinstance(provider_detail, dict) else None
+            if not isinstance(raw, dict):
                 continue
-
-            value = raw[key]
-
-            if key == "domain_age_days":
-                try:
-                    if float(value) <= _NEWLY_REGISTERED_DAYS_THRESHOLD:
-                        return True
-                except (TypeError, ValueError):
+            for key in _DOMAIN_AGE_RAW_KEYS:
+                if key not in raw:
                     continue
+                value = raw[key]
+                if key == "domain_age_days":
+                    try:
+                        if float(value) <= _NEWLY_REGISTERED_DAYS_THRESHOLD:
+                            return True
+                    except (TypeError, ValueError):
+                        continue
 
     return False
+
+
+def _parse_creation_date_to_age_days(creation_date_str: str) -> Optional[float]:
+    """
+    Parse a domain creation date string into an age in days from now.
+    Handles two formats produced by the providers:
+      - Unix timestamp integer as a string (VirusTotal)
+      - ISO 8601 / RFC 3339 date string (WHOIS, RDAP)
+    Returns None if the string cannot be parsed.
+    """
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+
+    # Unix timestamp (VirusTotal stores creation_date as an integer epoch value)
+    try:
+        ts = float(creation_date_str)
+        dt = datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc)
+        return (now - dt).days
+    except (ValueError, OSError, OverflowError):
+        pass
+
+    # ISO 8601 / RFC 3339 strings from WHOIS and RDAP, e.g.:
+    #   "2024-03-15T10:22:00Z", "2024-03-15T10:22:00+00:00", "2024-03-15"
+    for fmt in (
+        "%Y-%m-%dT%H:%M:%SZ",
+        "%Y-%m-%dT%H:%M:%S+00:00",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d",
+    ):
+        try:
+            dt = datetime.datetime.strptime(creation_date_str[:len(fmt)], fmt)
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+            return (now - dt).days
+        except ValueError:
+            continue
+
+    return None
 
 
 # ==========================================
@@ -609,7 +663,7 @@ def _rule_newly_registered_domain_javascript(
     for ioc_type, ioc_value, entry in _flatten_ti_entries(threat_intelligence):
         if ioc_type != "domain":
             continue
-        if _looks_newly_registered(entry):
+        if _looks_newly_registered(threat_intelligence, ioc_value):
             return _finding(
                 title="JavaScript Referencing a Newly Registered Domain",
                 severity=SEVERITY_HIGH,

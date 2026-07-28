@@ -54,29 +54,15 @@
 # (modules.correlation, modules.attack_chain, modules.evidence_explorer,
 # modules.report) needs no changes.
 
-import os
 import re
 import shutil
-import logging
 
 from urllib.parse import urlparse
 
 from modules.parsers.helpers import run_command, decode_pdf_string
+from modules.logging_config import get_logger
 
-
-# ==========================================
-# LOGGING SETUP
-# ==========================================
-
-os.makedirs("logs", exist_ok=True)
-
-logging.basicConfig(
-    filename="logs/embedded_extraction.log",
-    level=logging.ERROR,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
-
-log = logging.getLogger(__name__)
+log = get_logger(__name__, "logs/embedded_extraction.log")
 
 
 # ==========================================

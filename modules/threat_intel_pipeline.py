@@ -129,6 +129,7 @@ _CATEGORY_TO_TYPE: Dict[str, IocType] = {
     "URLs": IocType.URL,
     "Domains": IocType.DOMAIN,
     "IPs": IocType.IP,
+    "Hashes": IocType.HASH,
 }
 
 
@@ -139,10 +140,11 @@ def _collect_jobs(ioc_data: Dict[str, List[str]]) -> List[Tuple[str, Ioc]]:
     defensive dedup pass across the whole dict by (type, value) — so
     "perform one enrichment and reuse the result" holds even if the
     same value could theoretically appear under more than one
-    category. Only IOC types iocs.py actually extracts (URL, DOMAIN,
-    IP) are ever produced here — HASH IOCs are simply never
-    constructed, which is how "skip unsupported IOC types
-    automatically" is satisfied for this integration point.
+    category. IOC types iocs.py extracts (URL, DOMAIN, IP) are
+    produced, plus HASH IOCs (from extracted embedded files) when
+    present. Unsupported IOC types are never constructed, which is how
+    "skip unsupported IOC types automatically" is satisfied for this
+    integration point.
     """
 
     jobs: List[Tuple[str, Ioc]] = []
@@ -327,8 +329,8 @@ def enrich_extracted_iocs(
     analysis continues unaffected, exactly as before Step 9.
     """
 
-    legacy: Dict[str, Dict[str, Any]] = {"URLs": {}, "Domains": {}, "IPs": {}}
-    typed: Dict[str, Dict[str, EnrichmentResult]] = {"URLs": {}, "Domains": {}, "IPs": {}}
+    legacy: Dict[str, Dict[str, Any]] = {"URLs": {}, "Domains": {}, "IPs": {}, "Hashes": {}}
+    typed: Dict[str, Dict[str, EnrichmentResult]] = {"URLs": {}, "Domains": {}, "IPs": {}, "Hashes": {}}
 
     try:
         jobs = _collect_jobs(ioc_data or {})

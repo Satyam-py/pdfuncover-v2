@@ -546,10 +546,12 @@ def render_html(model: ReportModel) -> str:
             parts.append(f"<tr><th>SHA256</th><td class='mono'>{_esc(ef.sha256 or 'N/A')}</td></tr>")
             parts.append(f"<tr><th>Threat Intel</th><td>{_esc(ef.threat_intel)}</td></tr>")
             parts.append(f"<tr><th>Risk</th><td>{_badge(ef.risk) if ef.risk else 'None'}</td></tr>")
-            parts.append("</table>")
             if ef.reasons:
-                parts.append("<ul>" + "".join(f"<li>{_esc(r)}</li>" for r in ef.reasons) + "</ul>")
-            parts.append("</div>")
+                parts.append(f"<tr><th>Reasons</th><td><ul>")
+                for r in ef.reasons:
+                    parts.append(f"<li>{_esc(r)}</li>")
+                parts.append("</ul></td></tr>")
+            parts.append("</table></div>")
     else:
         parts.append("<p><i>No embedded files were extracted.</i></p>")
 
@@ -557,37 +559,40 @@ def render_html(model: ReportModel) -> str:
     parts.append("<h2>7. JavaScript Analysis</h2><div class='card'><table>")
     parts.append(f"<tr><th>Detected</th><td>{js.detected}</td></tr>")
     parts.append(f"<tr><th>OpenAction</th><td>{js.openaction}</td></tr>")
-    parts.append(f"<tr><th>Obfuscation Status</th><td>{'Obfuscated' if js.obfuscated else 'Not obfuscated'}</td></tr>")
+    parts.append(f"<tr><th>Obfuscation</th><td>{'Obfuscated' if js.obfuscated else 'Not obfuscated'}</td></tr>")
     parts.append(f"<tr><th>Suspicious Functions</th><td>{_esc(', '.join(js.suspicious_functions) or 'None')}</td></tr>")
-    parts.append("</table>")
     if js.decoded_preview:
-        parts.append(f"<p><b>Decoded Preview:</b> <span class='mono'>{_esc(js.decoded_preview)}</span></p>")
-    parts.append("</div>")
+        parts.append(f"<tr><th>Decoded Preview</th><td class='mono'>{_esc(js.decoded_preview)}</td></tr>")
+    parts.append("</table></div>")
 
     # 8
-    parts.append("<h2>8. Network Indicators</h2><table>")
+    parts.append("<h2>8. Network Indicators</h2><div class='card'><table>")
     parts.append(f"<tr><th>URLs</th><td>{_esc(', '.join(ni.urls) or 'None')}</td></tr>")
     parts.append(f"<tr><th>Domains</th><td>{_esc(', '.join(ni.domains) or 'None')}</td></tr>")
     parts.append(f"<tr><th>IPs</th><td>{_esc(', '.join(ni.ips) or 'None')}</td></tr>")
     parts.append(f"<tr><th>Emails</th><td>{_esc(', '.join(ni.emails) or 'None')}</td></tr>")
-    parts.append("</table>")
+    parts.append("</table></div>")
 
     # 9
-    parts.append("<h2>9. MITRE ATT&amp;CK Mapping</h2>")
+    parts.append("<h2>9. MITRE ATT&CK Mapping</h2>")
     if model.mitre_mappings:
         parts.append("<table><tr><th>Tactic</th><th>Technique</th><th>Reason</th></tr>")
         for m in model.mitre_mappings:
             parts.append(f"<tr><td>{_esc(m.tactic)}</td><td>{_esc(m.technique)}</td><td>{_esc(m.reason)}</td></tr>")
         parts.append("</table>")
     else:
-        parts.append("<p><i>No MITRE ATT&amp;CK techniques mapped.</i></p>")
+        parts.append("<p><i>No MITRE ATT&CK techniques mapped.</i></p>")
 
     # 10
-    parts.append("<h2>10. Analyst Recommendations</h2>")
+    parts.append("<h2>10. Analyst Recommendations</h2><div class='card'>")
     if model.recommendations:
-        parts.append("<ul>" + "".join(f"<li>{_esc(r)}</li>" for r in model.recommendations) + "</ul>")
+        parts.append("<ul>")
+        for r in model.recommendations:
+            parts.append(f"<li>{_esc(r)}</li>")
+        parts.append("</ul>")
     else:
         parts.append("<p><i>No specific recommendations.</i></p>")
+    parts.append("</div>")
 
     # 11
     parts.append("<h2>11. Attack Chain</h2>")
@@ -598,7 +603,10 @@ def render_html(model: ReportModel) -> str:
             parts.append(f"<p><b>Confidence:</b> {_esc(step.confidence)}</p>")
             parts.append(f"<p><b>Description:</b> {_esc(step.description)}</p>")
             if step.evidence:
-                parts.append("<ul>" + "".join(f"<li>{_esc(ev)}</li>" for ev in step.evidence) + "</ul>")
+                parts.append("<p><b>Evidence:</b><ul>")
+                for ev in step.evidence:
+                    parts.append(f"<li>{_esc(ev)}</li>")
+                parts.append("</ul></p>")
             if step.mitre:
                 parts.append(f"<p><b>MITRE ATT&amp;CK:</b> {_esc(', '.join(step.mitre))}</p>")
             parts.append("</div>")
@@ -620,15 +628,4 @@ def render_html(model: ReportModel) -> str:
     parts.append("</table></div>")
 
     parts.append("</body></html>")
-
-    return "\n".join(parts)
-
-
-RENDERERS = {
-    "json": render_json,
-    "markdown": render_markdown,
-    "md": render_markdown,
-    "html": render_html,
-    "text": render_text,
-    "txt": render_text,
-}
+    return "".join(parts)

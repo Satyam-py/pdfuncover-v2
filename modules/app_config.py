@@ -13,12 +13,13 @@ Both now read/write the same file, in one flat shape:
     {
         "virustotal_api_key": "...",
         "otx_api_key": "...",
-        "abuseipdb_api_key": "..."
+        "abuseipdb_api_key": "...",
+        "urlscan_api_key": "..."
     }
 
 Resolution order per key (same precedence both prior loaders already
 used independently — just applied consistently now):
-    1. Environment variable (VT_API_KEY / OTX_API_KEY / ABUSEIPDB_API_KEY)
+    1. Environment variable (VT_API_KEY / OTX_API_KEY / ABUSEIPDB_API_KEY / URLSCAN_API_KEY)
     2. This config file
     3. Not configured -> caller treats the provider as unavailable;
        nothing here ever raises.
@@ -45,6 +46,7 @@ _ENV_KEY_NAMES: Dict[str, str] = {
     "virustotal_api_key": "VT_API_KEY",
     "otx_api_key": "OTX_API_KEY",
     "abuseipdb_api_key": "ABUSEIPDB_API_KEY",
+    "urlscan_api_key": "URLSCAN_API_KEY",
 }
 
 

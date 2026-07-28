@@ -85,7 +85,7 @@ Public API:
     ArtifactType — the fixed vocabulary of artifact "type" values.
 """
 
-import logging
+
 import os
 import re
 from dataclasses import dataclass, field, asdict
@@ -114,15 +114,8 @@ except Exception:  # pragma: no cover - defensive only
 # LOGGING SETUP
 # ==========================================
 
-os.makedirs("logs", exist_ok=True)
-
-logging.basicConfig(
-    filename="logs/evidence_explorer.log",
-    level=logging.ERROR,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
-
-log = logging.getLogger(__name__)
+from modules.logging_config import get_logger
+log = get_logger(__name__, "analyzer.log")
 
 
 # ==========================================
@@ -314,13 +307,37 @@ def _provider_status(pr: Any) -> str:
 def _provider_malicious_flag(pr: Any) -> Optional[bool]:
     """True/False if this provider returned a reputation finding,
     None for context-only providers (WHOIS/RDAP) or failed lookups —
-    matches the legacy per-provider "malicious": bool|None convention."""
+    matches the legacy per-provider "malicious": bool|None convention.
+
+    The engine sets ThreatIntelResult.reputation=None (legacy field)
+    and populates ThreatIntelResult.reputations[] instead. We therefore
+    check reputations[] first and fall back to the legacy singular field
+    so that results from both the typed engine and the legacy path are
+    handled correctly.
+    """
 
     if not getattr(pr, "success", False):
         return None
 
     data = getattr(pr, "data", None)
-    rep = getattr(data, "reputation", None) if data is not None else None
+    if data is None:
+        return None
+
+    # Prefer the new reputations[] list (populated by the typed engine).
+    reputations = getattr(data, "reputations", None) or []
+    if reputations:
+        # Aggregate across all reputation findings for this provider result.
+        ratios = [
+            r.malicious / r.total
+            for r in reputations
+            if getattr(r, "total", 0) > 0
+        ]
+        if ratios:
+            return (sum(ratios) / len(ratios)) >= (_SUSPICIOUS_SCORE_THRESHOLD / 100.0)
+        return None
+
+    # Fall back to the legacy singular reputation field.
+    rep = getattr(data, "reputation", None)
     if rep is None:
         return None
 

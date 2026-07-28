@@ -50,7 +50,7 @@ below fits into fields that already exist):
       this domain" endpoint the way VirusTotal does.
 """
 
-import logging
+
 import os
 from urllib.parse import quote
 
@@ -66,14 +66,14 @@ from modules.threat_intel.models import (
     UrlContext,
     LookupError,
 )
-
-os.makedirs("logs", exist_ok=True)
-logging.basicConfig(
-    filename="logs/threat_intel.log",
-    level=logging.ERROR,
-    format="%(asctime)s [%(levelname)s] %(message)s"
+from modules.threat_intel.providers.helpers import (
+    make_api_key_header,
+    http_get_json,
 )
-log = logging.getLogger(__name__)
+from modules.app_config import get_api_key
+
+from modules.logging_config import get_logger
+log = get_logger(__name__, "analyzer.log")
 
 PROVIDER_NAME = "URLScan"
 
@@ -84,62 +84,6 @@ _TIMEOUT = 20
 # urlscan searches can return large result sets; this keeps the
 # categories list readable rather than dumping every scan ever seen.
 _MAX_AGGREGATED_HITS = 10
-
-
-# ==========================================
-# HTTP HELPER
-# ==========================================
-
-def _headers(api_key):
-    return {"API-Key": api_key} if api_key else {}
-
-
-def _request(url, api_key):
-    """
-    Perform a single urlscan.io API GET request.
-    Returns (json_dict, LookupError) — exactly one of the two is None.
-    """
-
-    try:
-        r = requests.get(url, headers=_headers(api_key), timeout=_TIMEOUT)
-
-    except requests.exceptions.Timeout:
-        return None, LookupError.NETWORK_ERROR
-
-    except requests.exceptions.RequestException as e:
-        log.error(f"urlscan.io request failed: {e}")
-        return None, LookupError.NETWORK_ERROR
-
-    if r.status_code == 404:
-        return None, LookupError.NOT_FOUND
-
-    if r.status_code in (401, 403):
-        return None, LookupError.AUTH_ERROR
-
-    if r.status_code == 429:
-        return None, LookupError.RATE_LIMITED
-
-    if r.status_code >= 400:
-        return None, LookupError.UNKNOWN
-
-    try:
-        return r.json(), None
-
-    except ValueError as e:
-        log.error(f"urlscan.io response JSON parse failed: {e}")
-        return None, LookupError.PARSE_ERROR
-
-
-def _search(query, api_key):
-    """GET /search/?q=<query> — find existing scans matching `query`."""
-    url = f"{_BASE_URL}/search/?q={quote(query)}"
-    return _request(url, api_key)
-
-
-def _result(uuid, api_key):
-    """GET /result/{uuid}/ — full detail for one specific scan."""
-    url = f"{_BASE_URL}/result/{uuid}/"
-    return _request(url, api_key)
 
 
 # ==========================================
@@ -203,7 +147,13 @@ def lookup_url(url, api_key):
 
     ioc = Ioc(value=url, type=IocType.URL)
 
-    data, err = _search(f'page.url:"{url}"', api_key)
+    headers = make_api_key_header(api_key, "API-Key")
+    params = {"q": f'page.url:"{url}"'}
+
+    data, err = http_get_json(
+        f"{_BASE_URL}/search/", headers=headers, params=params, timeout=_TIMEOUT,
+        provider_name=PROVIDER_NAME
+    )
     if err:
         return ProviderResult(provider=PROVIDER_NAME, ioc=ioc, success=False, error=err)
 
@@ -221,7 +171,11 @@ def lookup_url(url, api_key):
     source = top
 
     if uuid:
-        detail, detail_err = _result(uuid, api_key)
+        detail_headers = make_api_key_header(api_key, "API-Key")
+        detail, detail_err = http_get_json(
+            f"{_BASE_URL}/result/{uuid}/", headers=detail_headers, timeout=_TIMEOUT,
+            provider_name=PROVIDER_NAME
+        )
         if detail_err:
             log.error(f"urlscan.io detail fetch failed for {uuid}: {detail_err}")
         else:
@@ -296,7 +250,13 @@ def lookup_domain(domain, api_key):
 
     ioc = Ioc(value=domain, type=IocType.DOMAIN)
 
-    data, err = _search(f'domain:"{domain}"', api_key)
+    headers = make_api_key_header(api_key, "API-Key")
+    params = {"q": f'domain:"{domain}"'}
+
+    data, err = http_get_json(
+        f"{_BASE_URL}/search/", headers=headers, params=params, timeout=_TIMEOUT,
+        provider_name=PROVIDER_NAME
+    )
     if err:
         return ProviderResult(provider=PROVIDER_NAME, ioc=ioc, success=False, error=err)
 
@@ -363,7 +323,13 @@ def lookup_ip(ip, api_key):
 
     ioc = Ioc(value=ip, type=IocType.IP)
 
-    data, err = _search(f'page.ip:"{ip}"', api_key)
+    headers = make_api_key_header(api_key, "API-Key")
+    params = {"q": f'page.ip:"{ip}"'}
+
+    data, err = http_get_json(
+        f"{_BASE_URL}/search/", headers=headers, params=params, timeout=_TIMEOUT,
+        provider_name=PROVIDER_NAME
+    )
     if err:
         return ProviderResult(provider=PROVIDER_NAME, ioc=ioc, success=False, error=err)
 

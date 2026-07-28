@@ -24,7 +24,7 @@ ProviderResult with a populated (all-zero) ReputationFinding — never
 an error.
 """
 
-import logging
+
 import os
 
 import requests
@@ -38,14 +38,13 @@ from modules.threat_intel.models import (
     IPContext,
     LookupError,
 )
-
-os.makedirs("logs", exist_ok=True)
-logging.basicConfig(
-    filename="logs/threat_intel.log",
-    level=logging.ERROR,
-    format="%(asctime)s [%(levelname)s] %(message)s"
+from modules.threat_intel.providers.helpers import (
+    make_api_key_header,
+    http_get_json,
 )
-log = logging.getLogger(__name__)
+
+from modules.logging_config import get_logger
+log = get_logger(__name__, "analyzer.log")
 
 PROVIDER_NAME = "AbuseIPDB"
 
@@ -78,54 +77,6 @@ _CATEGORY_LABELS = {
     22: "SSH",
     23: "IoT Targeted",
 }
-
-
-# ==========================================
-# HTTP HELPER
-# ==========================================
-
-def _headers(api_key):
-    return {"Key": api_key, "Accept": "application/json"}
-
-
-def _request(ip, api_key):
-    """
-    Perform a single AbuseIPDB API GET request.
-    Returns (json_dict, LookupError) — exactly one of the two is None.
-    """
-
-    params = {"ipAddress": ip, "maxAgeInDays": _MAX_AGE_DAYS}
-
-    try:
-        r = requests.get(
-            _BASE_URL, headers=_headers(api_key), params=params, timeout=_TIMEOUT
-        )
-
-    except requests.exceptions.Timeout:
-        return None, LookupError.NETWORK_ERROR
-
-    except requests.exceptions.RequestException as e:
-        log.error(f"AbuseIPDB request failed: {e}")
-        return None, LookupError.NETWORK_ERROR
-
-    if r.status_code == 404:
-        return None, LookupError.NOT_FOUND
-
-    if r.status_code in (401, 403):
-        return None, LookupError.AUTH_ERROR
-
-    if r.status_code == 429:
-        return None, LookupError.RATE_LIMITED
-
-    if r.status_code >= 400:
-        return None, LookupError.UNKNOWN
-
-    try:
-        return r.json(), None
-
-    except ValueError as e:
-        log.error(f"AbuseIPDB response JSON parse failed: {e}")
-        return None, LookupError.PARSE_ERROR
 
 
 # ==========================================
@@ -175,7 +126,13 @@ def lookup_ip(ip, api_key):
 
     ioc = Ioc(value=ip, type=IocType.IP)
 
-    data, err = _request(ip, api_key)
+    headers = make_api_key_header(api_key, "Key")
+    headers["Accept"] = "application/json"
+    params = {"ipAddress": ip, "maxAgeInDays": _MAX_AGE_DAYS}
+
+    data, err = http_get_json(
+        _BASE_URL, headers=headers, params=params, timeout=_TIMEOUT, provider_name=PROVIDER_NAME
+    )
     if err:
         return ProviderResult(provider=PROVIDER_NAME, ioc=ioc, success=False, error=err)
 

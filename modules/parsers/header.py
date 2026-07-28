@@ -4,7 +4,6 @@
 # former extract_embedded_objects()). Moved verbatim — no logic changed.
 
 import os
-import logging
 
 from modules.parsers.helpers import validate_pdf_header
 
@@ -13,15 +12,9 @@ from modules.parsers.helpers import validate_pdf_header
 # LOGGING SETUP
 # ==========================================
 
-os.makedirs("logs", exist_ok=True)
+from modules.logging_config import get_logger
 
-logging.basicConfig(
-    filename="logs/embedded_extraction.log",
-    level=logging.ERROR,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
-
-log = logging.getLogger(__name__)
+log = get_logger(__name__, "logs/embedded_extraction.log")
 
 
 def analyze_header(pdf_path):
