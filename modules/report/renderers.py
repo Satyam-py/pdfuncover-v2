@@ -54,10 +54,29 @@ SECTION_TITLES = [
 # JSON
 # ==========================================
 
-def render_json(model: ReportModel) -> str:
-    """Full machine-readable dump of the report model."""
+def render_json(model: ReportModel, output_dir: str) -> str:
+    """Full machine-readable dump of the report model.
+    
+    Args:
+        model: The ReportModel to render.
+        output_dir: Directory where the report file will be written.
+    
+    Returns:
+        Path to the written file, or None if writing failed.
+    """
 
-    return json.dumps(model.to_dict(), indent=2, default=str)
+    import os
+    
+    content = json.dumps(model.to_dict(), indent=2, default=str)
+    
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+        report_path = os.path.join(output_dir, "report.json")
+        with open(report_path, "w", encoding="utf-8") as f:
+            f.write(content)
+        return report_path
+    except Exception as e:
+        return None
 
 
 # ==========================================
@@ -81,8 +100,19 @@ def _txt_tree(node: EvidenceTreeNode, prefix: str = "", lines: List[str] = None)
     return lines
 
 
-def render_text(model: ReportModel) -> str:
+def render_text(model: ReportModel, output_dir: str) -> str:
+    """Render report as plain text.
+    
+    Args:
+        model: The ReportModel to render.
+        output_dir: Directory where the report file will be written.
+    
+    Returns:
+        Path to the written file, or None if writing failed.
+    """
 
+    import os
+    
     sep = "=" * 70
     lines: List[str] = []
 
@@ -240,7 +270,16 @@ def render_text(model: ReportModel) -> str:
             w(f"  {k:<18}: {ap.metadata[k]}")
     w(sep)
 
-    return "\n".join(lines)
+    content = "\n".join(lines)
+    
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+        report_path = os.path.join(output_dir, "report.txt")
+        with open(report_path, "w", encoding="utf-8") as f:
+            f.write(content)
+        return report_path
+    except Exception as e:
+        return None
 
 
 # ==========================================
@@ -261,8 +300,19 @@ def _md_tree(node: EvidenceTreeNode, depth: int = 0) -> List[str]:
     return lines
 
 
-def render_markdown(model: ReportModel) -> str:
+def render_markdown(model: ReportModel, output_dir: str) -> str:
+    """Render report as Markdown.
+    
+    Args:
+        model: The ReportModel to render.
+        output_dir: Directory where the report file will be written.
+    
+    Returns:
+        Path to the written file, or None if writing failed.
+    """
 
+    import os
+    
     lines: List[str] = []
 
     def w(s: str = "") -> None:
@@ -417,7 +467,16 @@ def render_markdown(model: ReportModel) -> str:
         if ap.metadata.get(k):
             w(f"| {k} | {ap.metadata[k]} |")
 
-    return "\n".join(lines)
+    content = "\n".join(lines)
+    
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+        report_path = os.path.join(output_dir, "report.md")
+        with open(report_path, "w", encoding="utf-8") as f:
+            f.write(content)
+        return report_path
+    except Exception as e:
+        return None
 
 
 # ==========================================
@@ -465,8 +524,19 @@ def _html_tree(node: EvidenceTreeNode, depth: int = 0) -> str:
     return out
 
 
-def render_html(model: ReportModel) -> str:
+def render_html(model: ReportModel, output_dir: str) -> str:
+    """Render report as HTML.
+    
+    Args:
+        model: The ReportModel to render.
+        output_dir: Directory where the report file will be written.
+    
+    Returns:
+        Path to the written file, or None if writing failed.
+    """
 
+    import os
+    
     es = model.executive_summary
     ts = model.threat_summary
     js = model.javascript
@@ -628,4 +698,13 @@ def render_html(model: ReportModel) -> str:
     parts.append("</table></div>")
 
     parts.append("</body></html>")
-    return "".join(parts)
+    content = "".join(parts)
+    
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+        report_path = os.path.join(output_dir, "report.html")
+        with open(report_path, "w", encoding="utf-8") as f:
+            f.write(content)
+        return report_path
+    except Exception as e:
+        return None

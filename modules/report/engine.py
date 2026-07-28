@@ -57,6 +57,7 @@ from modules.threat_intel.models import (
     IPContext,
     FileContext,
     UrlContext,
+    LookupError,
     merge_ip_context,
     merge_domain_context,
     merge_file_context,
@@ -247,14 +248,95 @@ def _aggregate_result(
 
 
 # ==========================================
-# PROVIDER EXECUTION
+# PROVIDER EXECUTION (with RDAP-first/WHOIS-fallback for domains)
 # ==========================================
+
+def _run_provider(provider_reg: ProviderRegistration, ioc: Ioc, config: Dict[str, Any]) -> Optional[ProviderResult]:
+    """
+    Execute a single provider and return its ProviderResult, or None if skipped.
+    """
+    # Skip if this provider doesn't support this IOC type
+    if not provider_reg.supports(ioc.type):
+        return None
+
+    # Skip if this provider requires an API key and we don't have it
+    if provider_reg.requires_api_key:
+        api_key = config.get(provider_reg.config_key)
+        if not api_key:
+            log.warning(
+                f"Skipping {provider_reg.name}: no API key configured "
+                f"({provider_reg.config_key})"
+            )
+            return None
+    else:
+        api_key = None
+
+    # Execute the provider lookup
+    try:
+        lookup_fn = provider_reg.lookups[ioc.type]
+        result = lookup_fn(ioc.value, api_key)
+        return result
+
+    except Exception as e:
+        log.error(
+            f"Exception calling {provider_reg.name}.lookup_{ioc.type.value}(): {e}"
+        )
+        # Create a failed result to preserve the error in the output
+        return ProviderResult(
+            provider=provider_reg.name,
+            ioc=ioc,
+            success=False,
+            error=None,
+            error_message=str(e),
+        )
+
+
+def _should_run_whois_fallback(rdap_result: Optional[ProviderResult]) -> bool:
+    """
+    Determine if WHOIS should run as a fallback after RDAP for domain lookups.
+    
+    WHOIS runs if RDAP:
+    - Did not run (None)
+    - Failed with NOT_FOUND, NETWORK_ERROR, PARSE_ERROR, or RATE_LIMITED
+    - Succeeded but returned empty/minimal context (no meaningful data)
+    
+    WHOIS does NOT run if RDAP already returned valid context.
+    """
+    if rdap_result is None:
+        return True
+    
+    # WHOIS fallback for these error types
+    if not rdap_result.success:
+        if rdap_result.error in (
+            LookupError.NOT_FOUND,
+            LookupError.NETWORK_ERROR,
+            LookupError.PARSE_ERROR,
+            LookupError.RATE_LIMITED,
+        ):
+            log.info(f"[WHOIS] Running fallback lookup (RDAP error: {rdap_result.error.value})")
+            return True
+        # Don't fallback for AUTH_ERROR or UNKNOWN
+        return False
+    
+    # RDAP succeeded - check if it returned meaningful context
+    if rdap_result.data is None or rdap_result.data.domain_context is None:
+        log.info("[WHOIS] Running fallback lookup (RDAP returned no domain context)")
+        return True
+    
+    # RDAP returned valid context - skip WHOIS
+    log.info("[WHOIS] Skipped (RDAP succeeded with valid context)")
+    return False
+
 
 def enrich_ioc(ioc: Ioc, config: Dict[str, Any]) -> EnrichmentResult:
     """
-    Enrich one IOC by dispatching it to every provider that supports
-    its type, aggregating all results (success and failure) into a
-    single EnrichmentResult.
+    Enrich one IOC by dispatching it to providers.
+    
+    Special handling for domains:
+    - RDAP is the PRIMARY provider (always runs first)
+    - WHOIS is the FALLBACK (only runs if RDAP fails/returns minimal data)
+    
+    For all other IOC types, providers run in standard registry order.
 
     Args:
         ioc: The (type, value) pair to enrich.
@@ -274,44 +356,50 @@ def enrich_ioc(ioc: Ioc, config: Dict[str, Any]) -> EnrichmentResult:
 
     provider_results: List[ProviderResult] = []
 
-    for provider_reg in PROVIDERS:
+    # Special handling for domain IOCs: RDAP first, then WHOIS fallback
+    if ioc.type == IocType.DOMAIN:
+        rdap_result = None
+        
+        # Step 1: Run RDAP (primary provider for domains)
+        for provider_reg in PROVIDERS:
+            if provider_reg.name == "RDAP":
+                rdap_result = _run_provider(provider_reg, ioc, config)
+                if rdap_result:
+                    log.info("[RDAP] Lookup executed")
+                    provider_results.append(rdap_result)
+                    if rdap_result.success:
+                        log.info("[RDAP] Lookup successful")
+                    else:
+                        log.info(f"[RDAP] Failed: {rdap_result.error.value if rdap_result.error else 'unknown'}")
+                break
+        
+        # Step 2: Run WHOIS as fallback (if appropriate)
+        if _should_run_whois_fallback(rdap_result):
+            for provider_reg in PROVIDERS:
+                if provider_reg.name == "WHOIS":
+                    whois_result = _run_provider(provider_reg, ioc, config)
+                    if whois_result:
+                        log.info("[WHOIS] Lookup executed")
+                        provider_results.append(whois_result)
+                        if whois_result.success:
+                            log.info("[WHOIS] Lookup successful")
+                        else:
+                            log.info(f"[WHOIS] Failed: {whois_result.error.value if whois_result.error else 'unknown'}")
+                    break
+        
+        # Step 3: Run remaining reputation providers for domains
+        for provider_reg in PROVIDERS:
+            if provider_reg.name not in ("RDAP", "WHOIS"):
+                result = _run_provider(provider_reg, ioc, config)
+                if result:
+                    provider_results.append(result)
 
-        # Skip if this provider doesn't support this IOC type
-        if not provider_reg.supports(ioc.type):
-            continue
-
-        # Skip if this provider requires an API key and we don't have it
-        if provider_reg.requires_api_key:
-            api_key = config.get(provider_reg.config_key)
-            if not api_key:
-                log.warning(
-                    f"Skipping {provider_reg.name}: no API key configured "
-                    f"({provider_reg.config_key})"
-                )
-                continue
-        else:
-            api_key = None
-
-        # Look up this IOC with this provider
-        try:
-            lookup_fn = provider_reg.lookups[ioc.type]
-            result = lookup_fn(ioc.value, api_key)
-            provider_results.append(result)
-
-        except Exception as e:
-            log.error(
-                f"Exception calling {provider_reg.name}.lookup_{ioc.type.value}(): {e}"
-            )
-            # Create a failed result to preserve the error in the output
-            provider_results.append(
-                ProviderResult(
-                    provider=provider_reg.name,
-                    ioc=ioc,
-                    success=False,
-                    error=None,
-                    error_message=str(e),
-                )
-            )
+    # Standard flow for non-domain IOCs: run all supporting providers
+    else:
+        for provider_reg in PROVIDERS:
+            result = _run_provider(provider_reg, ioc, config)
+            if result:
+                provider_results.append(result)
 
     # Aggregate all successful results into a single ThreatIntelResult
     aggregated = _aggregate_result(ioc, provider_results)

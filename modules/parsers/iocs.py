@@ -1,6 +1,6 @@
 # modules/parsers/iocs.py
 #
-# Indicator-of-compromise extraction: URLs, domains, and IP addresses.
+# Indicator-of-compromise extraction: URLs, domains, IP addresses, AND HASHES.
 #
 # REDESIGN NOTES (final implementation):
 #
@@ -23,6 +23,13 @@
 #   - IP matching uses boundary lookarounds so a 4-octet run can't be
 #     sliced out of a longer dotted-number sequence (e.g. a version
 #     string), and rejects non-canonical leading-zero octets.
+#   - HASH EXTRACTION (NEW): MD5 (32 hex), SHA1 (40 hex), SHA256 (64 hex)
+#     are extracted via regex patterns that enforce:
+#     - Exact length (32, 40, or 64 hex characters)
+#     - Word boundaries (not sliced from longer hex runs)
+#     - Valid hex-only content ([0-9a-fA-F])
+#     Deduplication via seen set just like other IOC types, preserving
+#     first-seen order. Hashes are normalized to lowercase.
 #   - All three output lists de-duplicate via a `seen` set while
 #     preserving first-seen order (the old code did an O(n) `in` scan
 #     against a growing list for the same effect).
@@ -32,7 +39,8 @@
 #     the regexes below ever see them.
 #
 # Public API (extract_iocs(pdf_path, strings_output) -> dict) and the
-# extraction logic/regexes above are unchanged.
+# extraction logic/regexes above are unchanged except for the addition of
+# hash extraction.
 #
 # STEP 9 CHANGE: this module previously called
 # modules/parsers/ioc_enrichment.py (which in turn called the older
@@ -192,19 +200,51 @@ def _is_valid_ip(ip):
 
 
 # ==========================================
+# HASH EXTRACTION (MD5, SHA1, SHA256)
+# ==========================================
+#
+# Hashes are extracted from PDF text/binary content via regex patterns
+# that match exact lengths with word boundaries, preventing false positives
+# from longer hex sequences. Patterns:
+#   - MD5:    exactly 32 hex chars, word-bounded
+#   - SHA1:   exactly 40 hex chars, word-bounded
+#   - SHA256: exactly 64 hex chars, word-bounded
+#
+# All hashes are normalized to lowercase for consistency.
+
+_MD5_PATTERN = re.compile(r"\b[a-fA-F0-9]{32}\b")
+_SHA1_PATTERN = re.compile(r"\b[a-fA-F0-9]{40}\b")
+_SHA256_PATTERN = re.compile(r"\b[a-fA-F0-9]{64}\b")
+
+
+def _is_valid_hash(hash_str):
+    """
+    Basic structural validation for hash strings. Patterns already enforce
+    length and hex-only content via regex, but this provides an extra
+    sanity check if called directly.
+    """
+    if not hash_str:
+        return False
+    if not all(c in "0123456789abcdefABCDEF" for c in hash_str):
+        return False
+    length = len(hash_str)
+    return length in (32, 40, 64)  # MD5, SHA1, SHA256
+
+
+# ==========================================
 # MAIN ENTRY POINT
 # ==========================================
 
 def extract_iocs(pdf_path, strings_output):
     """
-    Extract URLs, domains, and IP addresses referenced inside the PDF.
+    Extract URLs, domains, IP addresses, and file hashes (MD5/SHA1/SHA256)
+    referenced inside the PDF.
 
     `strings_output` is the `strings <pdf_path>` output computed once
     by the orchestrator and shared across parsers.
 
-    Returns the same "IOCs" dict shape the original
-    extract_embedded_objects() produced:
-        {"URLs": [...], "Domains": [...], "IPs": [...]}
+    Returns the "IOCs" dict shape:
+        {"URLs": [...], "Domains": [...], "IPs": [...], "Hashes": [...]}
 
     STEP 9: this function no longer performs Threat Intelligence
     enrichment itself. The orchestrator (modules/embedded_extraction.py)
@@ -212,13 +252,19 @@ def extract_iocs(pdf_path, strings_output):
     function's return value immediately afterward, attaching the same
     "Threat Intelligence" key downstream consumers have always read —
     now backed by the new, frozen Threat Intelligence engine instead of
-    the previous system. See modules/threat_intel_pipeline.py.
+    the previous system, and now covering Hashes alongside URLs/Domains/IPs.
+    See modules/threat_intel_pipeline.py.
+
+    HASH EXTRACTION (NEW): Hashes are extracted from the same text sources
+    as URLs/Domains/IPs, and are treated as first-class IOCs. They flow
+    through the same threat-intelligence enrichment pipeline.
     """
 
     ioc_data = {
         "URLs": [],
         "Domains": [],
-        "IPs": []
+        "IPs": [],
+        "Hashes": []
     }
 
     uri_output = ""
@@ -307,8 +353,23 @@ def extract_iocs(pdf_path, strings_output):
             seen_ips.add(ip)
             clean_ips.append(ip)
 
+    # ------------------------------------------
+    # Hash extraction (MD5, SHA1, SHA256)
+    # ------------------------------------------
+
+    clean_hashes = []
+    seen_hashes = set()
+
+    for pattern in [_MD5_PATTERN, _SHA1_PATTERN, _SHA256_PATTERN]:
+        for match in pattern.finditer(combined_output):
+            hash_str = match.group(0).lower()
+            if _is_valid_hash(hash_str) and hash_str not in seen_hashes:
+                seen_hashes.add(hash_str)
+                clean_hashes.append(hash_str)
+
     ioc_data["URLs"] = clean_urls
     ioc_data["Domains"] = clean_domains
     ioc_data["IPs"] = clean_ips
+    ioc_data["Hashes"] = clean_hashes
 
     return ioc_data

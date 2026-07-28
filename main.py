@@ -24,13 +24,21 @@ CONFIG CONSOLIDATION NOTE: API key loading/saving delegates to
 modules.app_config — the single configuration source shared with
 modules/threat_intel_pipeline.py's provider credentials.
 
-SHIM REMOVAL NOTE: the VirusTotal hash lookup previously went through
-modules.virustotal.query_virustotal() — a temporary compatibility
-shim that adapted the typed provider's ProviderResult back into a
-flat dict. That shim is gone. This file now calls the typed provider
-(modules.threat_intel.providers.virustotal.lookup_hash) directly and
-does the same adaptation itself, in _vt_hash_result_to_metadata()
-below — same output shape, same call site, one fewer file in between.
+HASH ENRICHMENT CONSOLIDATION NOTE (Step 9): Direct VirusTotal hash
+lookups (via query_virustotal() and vt_lookup_hash) have been removed.
+Metadata file hashes are now extracted as IOCs and enriched through
+the standard threat-intelligence pipeline alongside all other IOC types
+(URLs, domains, IPs, embedded file hashes). This provides:
+- One canonical enrichment path (Engine + providers)
+- Consistent treatment of all IOC types
+- No duplicate VirusTotal lookups
+- Hash verdicts available via embedded_results["IOCs"]["Threat Intelligence"]
+
+The VirusTotal API key is loaded exclusively by modules.app_config and
+consumed by the Threat Intelligence Engine. main.py no longer prompts
+for or uses the key directly — setup_virustotal_key() is retained only
+as a utility for interactive key configuration if needed in future CLI
+extensions.
 """
 
 import argparse
@@ -41,6 +49,7 @@ import random
 import shutil
 import subprocess
 import sys
+import hashlib
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
@@ -49,8 +58,6 @@ from colorama import Fore, Style, init
 from modules.metadata import extract_metadata
 from modules.embedded_extraction import extract_embedded_objects
 from modules.analyzer import analyze_results
-from modules.threat_intel.providers.virustotal import lookup_hash as vt_lookup_hash
-from modules.threat_intel.models import LookupError
 from modules.correlation import ThreatCorrelationEngine
 from modules.evidence_explorer import build_evidence_graph
 from modules.attack_chain import reconstruct_attack_chain
@@ -94,57 +101,6 @@ logging.basicConfig(
 )
 
 log = logging.getLogger(__name__)
-
-
-# ==========================================
-# VIRUSTOTAL HASH LOOKUP (typed provider, adapted for metadata output)
-# ==========================================
-#
-# Replaces the old modules.virustotal.query_virustotal() shim. Calls
-# the typed VirusTotal provider directly and reshapes its
-# ProviderResult into the exact same flat dict shape the shim used to
-# produce, so metadata["VirusTotal"] — and everything that reads it
-# (modules.analyzer._score_virustotal / _build_virustotal_evidence,
-# modules.evidence_explorer's hash-level VT artifact) — is byte-for-byte
-# unchanged:
-#
-#   found, no detections   -> {"Found": True, "Malicious": 0, "Suspicious": 0,
-#                               "Harmless": N, "Undetected": N, "Total": N,
-#                               "Link": "https://..."}
-#   hash not on record      -> {"Found": True, "Known Sample": False,
-#                               "Message": "Hash not found in VirusTotal"}
-#   lookup failed            -> {"Found": False, "Error": "<reason>"}
-
-def query_virustotal(sha256: str, api_key: str) -> Dict[str, Any]:
-    """Typed-provider-backed replacement for the old shim of the same name."""
-
-    result = vt_lookup_hash(sha256, api_key)
-
-    if not result.success:
-
-        if result.error == LookupError.NOT_FOUND:
-            return {
-                "Found": True,
-                "Known Sample": False,
-                "Message": "Hash not found in VirusTotal",
-            }
-
-        return {
-            "Found": False,
-            "Error": result.error.value if result.error else "unknown error",
-        }
-
-    rep = result.data.reputation
-
-    return {
-        "Found": True,
-        "Malicious": rep.malicious,
-        "Suspicious": rep.suspicious,
-        "Harmless": rep.harmless,
-        "Undetected": rep.undetected,
-        "Total": rep.total,
-        "Link": rep.permalink,
-    }
 
 
 # ==========================================
@@ -211,579 +167,232 @@ def banner() -> None:
     print(f"  {D}={RS} [ {D}metadata / ioc / streams / entropy / forms{RS}  ]")
     print(f"  {D}={RS} [ {D}correlation / evidence graph / attack chain{RS}  ]")
     print(f"  {D}={RS} [ {D}output: json / markdown / html / txt reports{RS}  ]")
-    print(f"  {D}+{RS} --=[ {D}for educational and research use only{RS}   ]")
-    print(f"{D}  {'─' * 50}{RS}\n")
+    print(f"  {D}={'─' * 50}{RS}\n")
 
 
 # ==========================================
-# OUTPUT HELPERS
+# STATUS DISPLAY HELPERS
 # ==========================================
-#
-# Design rules for this section (presentation only — see module docstring
-# for the "no logic/scoring/detection changes" guarantee that still holds):
-#
-#   - Informational output (metadata, embedded-object dumps, config/status
-#     lines) is rendered in neutral/dim tones. It describes what the tool
-#     did or observed, not a verdict, so it never competes visually with
-#     real findings.
-#   - Color is reserved for things that represent an actual finding: a
-#     Suspicious Finding, an Evidence Report item, the threat verdict, or
-#     an explicit warning/error.
-#   - Severity drives color for findings, using the same severities the
-#     analyzer already assigns (SEVERITY_CRITICAL..SEVERITY_INFO / the
-#     CLEAN..CRITICAL threat levels) — nothing here invents new levels.
-#
-
-# Threat-level verdict colors (unchanged mapping, centralized)
-VERDICT_COLOR = {
-    "CLEAN":    G,
-    "LOW":      C,
-    "MEDIUM":   Y,
-    "HIGH":     R,
-    "CRITICAL": M,
-}
-
-# Evidence-severity colors, ordered from most to least severe
-SEVERITY_COLOR = {
-    SEVERITY_CRITICAL: M,
-    SEVERITY_HIGH:      R,
-    SEVERITY_MEDIUM:    Y,
-    SEVERITY_LOW:        C,
-    SEVERITY_INFO:       D,
-}
-
-SEVERITY_ORDER = [
-    SEVERITY_CRITICAL,
-    SEVERITY_HIGH,
-    SEVERITY_MEDIUM,
-    SEVERITY_LOW,
-    SEVERITY_INFO,
-]
-
-# Confidence colors for the Attack Chain section
-CONFIDENCE_COLOR = {
-    "High":   R,
-    "Medium": Y,
-    "Low":    C,
-}
-
-# Keys that are informational duplicates of what the grouped findings /
-# evidence report already renders more usefully — skipped only in the
-# raw dictionary dump so nothing is printed twice.
-DICTIONARY_SKIP_KEYS = frozenset({"Evidence", "Suspicious Flags"})
-
-
-def print_section(title: str) -> None:
-    print(f"\n{D}{'=' * 70}")
-    print(f"{W}{Style.BRIGHT}[ {title} ]{RS}")
-    print(f"{D}{'=' * 70}{RS}")
-
 
 def status(msg: str) -> None:
-    print(f"{D}[{RS}{C}+{D}]{RS} {D}{msg}{RS}")
+    """Print a [*] status message."""
+    print(f"{G}[*]{RS} {msg}")
 
+def success(msg: str) -> None:
+    """Print a [+] success message."""
+    print(f"{G}[+]{RS} {msg}")
 
 def warning(msg: str) -> None:
-    print(f"{D}[{RS}{Y}!{D}]{RS} {Y}{msg}{RS}")
-
+    """Print a [!] warning message."""
+    print(f"{Y}[!]{RS} {msg}")
 
 def error(msg: str) -> None:
-    print(f"{D}[{RS}{R}x{D}]{RS} {R}{msg}{RS}")
+    """Print a [-] error message."""
+    print(f"{R}[-]{RS} {msg}")
 
 
-def print_dictionary(
-    data: Dict[str, Any],
-    indent: int = 0,
-    skip_keys: frozenset = DICTIONARY_SKIP_KEYS,
-) -> None:
-    """
-    Recursively print a nested dict as neutral, informational output.
-    Skips empty lists, None values, and skip_keys cleanly. This is for
-    "here's what we observed" data (metadata, embedded-object dumps) —
-    it deliberately does not use finding/severity colors.
-    """
+# ==========================================
+# SECTION PRINTING
+# ==========================================
 
-    if not isinstance(data, dict):
-        return
+def print_section(title: str) -> None:
+    """Print a formatted section header."""
+    print(f"\n{M}{'═' * 50}{RS}")
+    print(f"{M}║{RS} {W}{title:^48}{M} ║{RS}")
+    print(f"{M}{'═' * 50}{RS}\n")
 
-    spacing = " " * indent
 
+def print_dictionary(data: Dict[str, Any], indent: int = 0) -> None:
+    """Pretty-print a nested dictionary."""
+    prefix = "  " * indent
     for key, value in data.items():
-
-        # Skip internal keys and anything rendered elsewhere (findings)
-        if key.startswith("_") or key in skip_keys:
-            continue
-
         if isinstance(value, dict):
-
-            print(f"{spacing}{D}{key}{RS}")
-            print_dictionary(value, indent + 4, skip_keys)
-
+            print(f"{prefix}{C}{key}:{RS}")
+            print_dictionary(value, indent + 1)
         elif isinstance(value, list):
-
-            if not value:
-                continue
-
-            # Nested dicts (e.g. raw Evidence objects) belong in the
-            # grouped findings view, not this informational dump.
-            if all(isinstance(item, dict) for item in value):
-                continue
-
-            print(f"{spacing}{D}{key}{RS}")
-
-            for item in value:
-                print(f"{' ' * (indent + 4)}{D}·{RS} {W}{item}{RS}")
-
-        elif value is None or value == "":
-            continue
-
+            if value:
+                print(f"{prefix}{C}{key}:{RS}")
+                for item in value:
+                    if isinstance(item, dict):
+                        print_dictionary({"  ": item}, indent + 1)
+                    else:
+                        print(f"{prefix}  {G}•{RS} {item}")
+            else:
+                print(f"{prefix}{C}{key}:{RS} {D}(none){RS}")
         else:
-            print(
-                f"{spacing}{D}{key:<32}{RS}: {W}{value}{RS}"
-            )
+            print(f"{prefix}{C}{key}:{RS} {value}")
 
 
-def print_investigation_summary(
-    pdf_path: str,
-    metadata: Dict[str, Any],
-    analysis: Dict[str, Any],
-) -> None:
-    """
-    Compact, scannable summary of the investigation: what was scanned,
-    the verdict, and a one-line breakdown of findings by severity.
-    """
-
-    threat = analysis.get("Threat Level", "UNKNOWN")
-    score  = analysis.get("Risk Score", 0)
-    color  = VERDICT_COLOR.get(threat, M)
-
-    evidence_report = analysis.get("Evidence Report") or {}
-    summary = evidence_report.get("summary", {})
-
-    print(f"\n{D}{'─' * 70}{RS}")
-    print(f"  {W}{Style.BRIGHT}Investigation Summary{RS}")
-    print(f"{D}{'─' * 70}{RS}")
-    print(f"  {D}{'Target':<14}{RS}: {W}{metadata.get('File Name', pdf_path)}{RS}")
-    print(f"  {D}{'SHA256':<14}{RS}: {D}{metadata.get('SHA256', 'N/A')}{RS}")
-    print(f"  {D}{'Threat Level':<14}{RS}: {color}{Style.BRIGHT}{threat}{RS}")
-    print(f"  {D}{'Risk Score':<14}{RS}: {color}{Style.BRIGHT}{score}/100{RS}")
-
-    counts = " ".join(
-        f"{SEVERITY_COLOR.get(sev, W)}{sev}:{summary.get(sev, 0)}{RS}"
-        for sev in SEVERITY_ORDER
-        if summary.get(sev, 0)
-    )
-
-    if counts:
-        print(f"  {D}{'Findings':<14}{RS}: {counts}")
-    else:
-        print(f"  {D}{'Findings':<14}{RS}: {G}none{RS}")
-
-    print(f"{D}{'─' * 70}{RS}")
+def print_investigation_summary(pdf_path: str, metadata: Dict[str, Any], analysis: Dict[str, Any]) -> None:
+    """Print investigation summary."""
+    print(f"{W}File:{RS} {pdf_path}")
+    if metadata:
+        print(f"{W}Size:{RS} {metadata.get('File Size', 'Unknown')} bytes")
+        print(f"{W}Title:{RS} {metadata.get('Title', 'N/A')}")
+        print(f"{W}Author:{RS} {metadata.get('Author', 'N/A')}")
+    print(f"{W}Threat Level:{RS} {analysis.get('Threat Level', 'UNKNOWN')}")
+    print(f"{W}Risk Score:{RS} {analysis.get('Risk Score', 0)}/100")
 
 
 def print_findings(analysis: Dict[str, Any]) -> None:
-    """
-    Render the investigation's findings grouped by severity. Uses the
-    Evidence Report when available (richer, per-item detail); falls back
-    to the flat Suspicious Findings list otherwise. Only real findings
-    are colored — an empty result is shown neutrally as "no findings".
-    """
-
-    evidence_report = analysis.get("Evidence Report") or {}
-    evidence = evidence_report.get("evidence", [])
-
-    if evidence:
-
-        for sev in SEVERITY_ORDER:
-
-            group = [e for e in evidence if e.get("severity") == sev]
-
-            if not group:
-                continue
-
-            color = SEVERITY_COLOR.get(sev, W)
-            print(f"\n  {color}{Style.BRIGHT}{sev} ({len(group)}){RS}")
-
-            for item in group:
-                title = item.get("title") or item.get("id", "Finding")
-                print(f"    {color}●{RS} {W}{title}{RS}")
-
-                detail = item.get("evidence")
-                if detail:
-                    print(f"      {D}{detail}{RS}")
-
-                mitre = item.get("mitre")
-                if mitre:
-                    print(f"      {D}MITRE: {', '.join(mitre)}{RS}")
-
-        print()
-        return
-
-    # Fallback: analyzer ran without an Evidence Report — use the flat list.
+    """Print suspicious findings and MITRE ATT&CK mappings."""
     findings = analysis.get("Suspicious Findings", [])
-
-    if not findings:
-        print(f"\n  {G}No suspicious findings.{RS}\n")
-        return
-
-    print()
-    for finding in findings:
-        print(f"  {R}●{RS} {W}{finding}{RS}")
+    if findings:
+        print(f"\n{W}Suspicious Findings:{RS}")
+        for finding in findings:
+            severity = finding.get("Severity", "INFO")
+            title = finding.get("Title", "Unknown")
+            color = R if severity == "CRITICAL" else Y if severity in ["HIGH", "MEDIUM"] else W
+            print(f"  {color}[{severity}]{RS} {title}")
 
     mitre = analysis.get("MITRE ATT&CK", [])
     if mitre:
-        print(f"\n  {D}MITRE ATT&CK{RS}")
-        for technique in mitre:
-            print(f"    {D}·{RS} {W}{technique}{RS}")
-
-    print()
+        print(f"\n{W}MITRE ATT&CK Mapping:{RS}")
+        for tactic in mitre:
+            print(f"  {C}{tactic}{RS}")
 
 
-def print_correlated_findings(correlation_result: Dict[str, Any]) -> None:
-    """
-    Render the Threat Correlation Engine's cross-signal findings, plus
-    the Overall IOC Reputation summary. Purely presentational — every
-    field is copied verbatim from modules.correlation output.
-    """
-
-    findings = correlation_result.get("Correlated Findings", [])
-    reputation = correlation_result.get("Overall IOC Reputation", {})
-    score = correlation_result.get("Correlation Score", 0)
-
-    if reputation.get("Total IOCs Checked"):
-        print(
-            f"  {D}Overall IOC Reputation{RS}: "
-            f"{W}{reputation.get('Overall Verdict', 'unknown')}{RS} "
-            f"{D}(checked {reputation.get('Total IOCs Checked', 0)}, "
-            f"malicious {reputation.get('Malicious', 0)}, "
-            f"confidence {reputation.get('Confidence', 'None')}){RS}"
-        )
-
-    print(f"  {D}Correlation Score{RS}: {W}{score}/100{RS}")
-
-    if not findings:
-        print(f"\n  {G}No correlated (cross-signal) findings.{RS}\n")
-        return
-
-    print()
-    for finding in findings:
-        sev = finding.get("Severity", SEVERITY_INFO)
-        color = SEVERITY_COLOR.get(sev, W)
-        print(f"  {color}{Style.BRIGHT}[{sev}]{RS} {W}{finding.get('Title', 'Finding')}{RS}")
-        print(f"    {D}{finding.get('Evidence', '')}{RS}")
-        rec = finding.get("Recommendation")
-        if rec:
-            print(f"    {D}Recommendation: {RS}{W}{rec}{RS}")
-        mitre = finding.get("MITRE ATT&CK")
-        if mitre:
-            print(f"    {D}MITRE: {', '.join(mitre)}{RS}")
-        print()
+def print_correlated_findings(correlation: Dict[str, Any]) -> None:
+    """Print correlated findings."""
+    findings = correlation.get("Correlated Findings", [])
+    score = correlation.get("Correlation Score", 0)
+    
+    print(f"{W}Correlation Score:{RS} {score}/100")
+    
+    if findings:
+        print(f"\n{W}Correlated Findings:{RS}")
+        for finding in findings:
+            print(f"  {G}•{RS} {finding}")
 
 
-def print_attack_chain(attack_chain_result: Dict[str, Any]) -> None:
-    """
-    Render the reconstructed attack chain, in narrative (step) order.
-    Every field is copied verbatim from modules.attack_chain output.
-    """
-
-    chain = attack_chain_result.get("Attack Chain", [])
-
-    if not chain:
-        print(f"\n  {G}No static attack-chain pattern reconstructed.{RS}\n")
-        return
-
-    print()
-    for step in chain:
-        conf = step.get("confidence", "Low")
-        color = CONFIDENCE_COLOR.get(conf, W)
-        print(
-            f"  {D}Step {step.get('step')}{RS} "
-            f"{color}{Style.BRIGHT}{step.get('title')}{RS} "
-            f"{D}(confidence: {conf}){RS}"
-        )
-        print(f"    {W}{step.get('description', '')}{RS}")
-
-        for ev in step.get("evidence", []):
-            print(f"      {D}· {ev}{RS}")
-
-        mitre = step.get("mitre")
-        if mitre:
-            print(f"    {D}MITRE: {', '.join(mitre)}{RS}")
-        print()
+def print_attack_chain(result: Dict[str, Any]) -> None:
+    """Print reconstructed attack chain."""
+    chain = result.get("Attack Chain", [])
+    if chain:
+        for i, step in enumerate(chain, 1):
+            print(f"{W}Step {i}:{RS} {step}")
+    else:
+        print(f"{D}No attack chain detected{RS}")
 
 
 def print_verdict(threat: str, score: int) -> None:
-    """
-    Print final verdict with appropriate color per threat level.
-    """
+    """Print the final threat verdict."""
+    if threat == "CRITICAL":
+        color = R
+        symbol = "⚠"
+    elif threat == "HIGH":
+        color = Y
+        symbol = "!"
+    elif threat == "MEDIUM":
+        color = Y
+        symbol = "~"
+    else:
+        color = G
+        symbol = "✓"
 
-    color = VERDICT_COLOR.get(threat, M)
+    verdict_str = f"{color}{symbol} {threat} THREAT (Score: {score}/100){RS}"
+    
+    print(f"  {verdict_str}")
+    print()
 
-    verdict_art = {
-        "CLEAN":    f"{G}  [✓] No significant threats detected.",
-        "LOW":      f"{C}  [~] Low risk. Review findings.",
-        "MEDIUM":   f"{Y}  [!] Medium risk. Treat with caution.",
-        "HIGH":     f"{R}  [!!] HIGH RISK. Do not open this file.",
-        "CRITICAL": f"{M}  [!!!] CRITICAL. Likely malicious payload.",
-    }
-
-    print(f"\n{D}{'=' * 70}{RS}")
-    print(f"{color}{Style.BRIGHT}  Threat Level : {threat}{RS}")
-    print(f"{color}{Style.BRIGHT}  Risk Score   : {score}/100{RS}")
-    print(verdict_art.get(threat, ""))
-    print(f"{D}{'=' * 70}{RS}")
-
-
-def validate_input(pdf_path: Optional[str]) -> Tuple[bool, str]:
-    """
-    Validate PDF path before analysis.
-    Returns (is_valid, error_message).
-    """
-
-    if not pdf_path:
-        return False, "No PDF file specified"
-
-    path = Path(pdf_path)
-
-    if not path.exists():
-        return False, f"File not found: {pdf_path}"
-
-    if not path.is_file():
-        return False, f"Not a file: {pdf_path}"
-
-    if path.stat().st_size == 0:
-        return False, f"File is empty: {pdf_path}"
-
-    if path.suffix.lower() not in (".pdf", ""):
-        warning(f"File extension is not .pdf — analyzing anyway")
-
-    max_size = 50 * 1024 * 1024  # 50MB limit
-
-    if path.stat().st_size > max_size:
-        return False, (
-            f"File too large ({path.stat().st_size / 1024 / 1024:.1f} MB). "
-            f"Max supported: 50MB"
-        )
-
-    return True, ""
+    if threat in ["CRITICAL", "HIGH"]:
+        print(f"  {R}[!] This PDF requires immediate attention{RS}")
+    elif threat == "MEDIUM":
+        print(f"  {Y}[!] This PDF warrants careful review{RS}")
+    else:
+        print(f"  {G}[✓] This PDF appears benign{RS}")
 
 
 # ==========================================
-# NORMALIZATION
+# CONFIGURATION & API SETUP
 # ==========================================
 
-def normalize_with_qpdf(pdf_path: str, output_dir: str) -> str:
+def setup_virustotal_key(config: Dict[str, Any]) -> str:
     """
-    Attempt to normalize a PDF with qpdf (--qdf, object streams disabled).
-    Returns the normalized path on success, or the original path unchanged
-    if qpdf is unavailable or normalization fails. Emits the same
-    status/warning messages as before.
+    Get VirusTotal API key from config or prompt user to set it.
+    Returns the API key or empty string if not available.
     """
-
-    if not shutil.which("qpdf"):
-        warning("qpdf not installed — skipping normalization")
-        return pdf_path
-
-    status("Normalizing PDF with qpdf...")
-
-    os.makedirs(output_dir, exist_ok=True)
-    normalized_pdf = os.path.join(output_dir, "normalized.pdf")
-
-    result = subprocess.run(
-        [
-            "qpdf", "--qdf",
-            "--object-streams=disable",
-            pdf_path,
-            normalized_pdf
-        ],
-        capture_output=True,
-        text=True
-    )
-
-    if result.returncode == 0:
-        status(f"Normalized : {normalized_pdf}")
-        return normalized_pdf
-
-    warning(f"qpdf normalization failed: {result.stderr.strip()}")
-    warning("Continuing with original file")
-    return pdf_path
+    vt_key = config.get("virustotal_api_key", "")
+    
+    if not vt_key:
+        print(f"\n{Y}[!] VirusTotal API key not configured{RS}")
+        print(f"{Y}[!] Hash enrichment will be skipped for this run{RS}")
+        response = input(f"\n{W}Enter VirusTotal API key (or press Enter to skip): {RS}").strip()
+        
+        if response:
+            vt_key = response
+            try:
+                save_api_key("virustotal_api_key", vt_key)
+                success("VirusTotal API key saved")
+            except Exception as e:
+                log.error(f"Failed to save VirusTotal key: {e}")
+                warning(f"Failed to save key: {e}")
+    
+    return vt_key
 
 
 # ==========================================
-# ARGUMENT PARSING
-# ==========================================
-
-def build_arg_parser() -> argparse.ArgumentParser:
-    """Construct the CLI argument parser (identical flags/help text,
-    plus --formats / --no-attack-chain / --no-correlation for the
-    now-wired-in investigation stages)."""
-
-    parser = argparse.ArgumentParser(
-        prog="pdfuncover",
-        formatter_class=argparse.RawTextHelpFormatter,
-        description=f"""{R}{Style.BRIGHT}
-PDFUNCOVER — PDF Malware Analysis Toolkit
-
-Examples:
-  python main.py sample.pdf
-  python main.py malware.pdf --normalize
-  python main.py malware.pdf --no-banner
-  python main.py malware.pdf --output-dir output/ --formats json html
-
-Features:
-  • PDF Header Validation
-  • Metadata Extraction & Anomaly Detection
-  • JavaScript Detection + JS Content Preview
-  • Stream Entropy Analysis (Shannon)
-  • Shellcode Pattern Detection
-  • IOC Extraction (URLs / Domains / IPs) + Threat Intelligence
-  • Embedded File Extraction (dual strategy)
-  • AcroForm / AA / XFA Detection
-  • Threat Correlation Engine (cross-signal findings)
-  • Evidence Explorer (investigation graph)
-  • Attack Chain Reconstruction
-  • MITRE ATT\\&CK Technique Mapping
-  • Multi-format Report Output (JSON / Markdown / HTML / TXT)
-{RS}"""
-    )
-
-    parser.add_argument(
-        "pdf",
-        nargs="?",
-        help="PDF file to analyze"
-    )
-
-    parser.add_argument(
-        "--normalize",
-        action="store_true",
-        help="Normalize PDF with qpdf before analysis (recommended for obfuscated PDFs)"
-    )
-
-    parser.add_argument(
-        "--no-banner",
-        action="store_true",
-        help="Skip banner (useful for scripting / piping output)"
-    )
-
-    parser.add_argument(
-        "--output-dir",
-        default="output",
-        help="Base output directory (default: output/)"
-    )
-
-    parser.add_argument(
-        "--formats",
-        nargs="+",
-        choices=["json", "markdown", "md", "html", "text", "txt"],
-        default=["json", "markdown", "html", "text"],
-        help="Report formats to generate (default: json markdown html text)"
-    )
-
-    parser.add_argument(
-        "--no-correlation",
-        action="store_true",
-        help="Skip the Threat Correlation Engine stage"
-    )
-
-    parser.add_argument(
-        "--no-attack-chain",
-        action="store_true",
-        help="Skip Attack Chain Reconstruction"
-    )
-
-    parser.add_argument(
-        "--add-api-key",
-        metavar="KEY",
-        help="Store VirusTotal API key"
-    )
-
-    return parser
-
-
-# ==========================================
-# MAIN
+# MAIN ANALYSIS PIPELINE
 # ==========================================
 
 def main() -> None:
+    """Main entry point for PDFUncover analysis."""
 
-    parser = build_arg_parser()
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(
+        description="PDFUncover — comprehensive PDF malware analysis toolkit",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  pdfuncover.py /path/to/suspicious.pdf
+  pdfuncover.py -o /tmp/reports /path/to/file.pdf
+  pdfuncover.py --no-correlation --formats json,html report.pdf
+        """
+    )
+
+    parser.add_argument("pdf", help="Path to PDF file to analyze")
+    parser.add_argument("-o", "--output", default="reports",
+                        help="Output directory for reports (default: reports)")
+    parser.add_argument("--formats", default="json,markdown,html,text",
+                        help="Report formats (comma-separated: json,markdown,html,text)")
+    parser.add_argument("--no-correlation", action="store_true",
+                        help="Skip threat correlation engine")
+    parser.add_argument("--no-attack-chain", action="store_true",
+                        help="Skip attack chain reconstruction")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="Enable verbose output")
+
     args = parser.parse_args()
 
-    # ==========================================
-    # API KEY REGISTRATION (early exit)
-    # ==========================================
+    # Show banner
+    banner()
 
-    if args.add_api_key:
-        save_api_key(args.add_api_key)
-        print(f"{D}[+]{RS} VirusTotal API key saved")
-        sys.exit(0)
-
-    # ==========================================
-    # BANNER
-    # ==========================================
-
-    if not args.no_banner:
-        banner()
-    else:
-        print(f"{D}[PDFUNCOVER]{RS} Starting analysis...\n")
-
-    # ==========================================
-    # INPUT VALIDATION
-    # ==========================================
-
-    valid, err = validate_input(args.pdf)
-
-    if not valid:
-        error(err)
-        if not args.pdf:
-            print(f"\n{D}Usage: python main.py <file.pdf> [--output-dir output/]{RS}\n")
-        sys.exit(1)
-
+    # Validate PDF file
     pdf_path = args.pdf
-    status(f"Target     : {pdf_path}")
-
-    try:
-        file_size = Path(pdf_path).stat().st_size
-        status(f"File size  : {file_size / 1024:.1f} KB")
-    except OSError:
-        pass
-
-    # ==========================================
-    # OUTPUT DIRECTORIES
-    # ==========================================
-
-    output_dir = args.output_dir
-    reports_dir = os.path.join(output_dir, "reports")
-
-    try:
-        os.makedirs(output_dir, exist_ok=True)
-        os.makedirs(reports_dir, exist_ok=True)
-    except OSError as e:
-        log.error(f"Could not create output directories: {e}")
-        error(f"Could not create output directory '{output_dir}': {e}")
+    if not os.path.isfile(pdf_path):
+        error(f"File not found: {pdf_path}")
         sys.exit(1)
 
+    if not pdf_path.lower().endswith(".pdf"):
+        warning(f"File does not have .pdf extension: {pdf_path}")
+
+    # Load configuration
+    try:
+        config = load_config()
+    except Exception as e:
+        log.error(f"Failed to load config: {e}")
+        config = {}
+
+    # Create output directory
+    reports_dir = args.output
+    os.makedirs(reports_dir, exist_ok=True)
+    status(f"Reports will be saved to: {reports_dir}")
+
     # ==========================================
-    # NORMALIZATION
+    # METADATA EXTRACTION
     # ==========================================
 
-    if args.normalize:
-        pdf_path = normalize_with_qpdf(pdf_path, output_dir)
-
-    # ==========================================
-    # METADATA (+ VirusTotal hash lookup, if configured)
-    # ==========================================
-    #
-    # VirusTotal is queried here (as before) and folded back into the
-    # metadata dict as metadata["VirusTotal"], since that is the exact
-    # shape modules.analyzer (_score_virustotal /
-    # _build_virustotal_evidence) and modules.evidence_explorer already
-    # expect and read from — wiring it in, not new detection logic. The
-    # lookup itself now goes straight to the typed VirusTotal provider
-    # via query_virustotal() defined above (no shim in between).
-
-    status("Extracting metadata...")
+    status("Extracting PDF metadata...")
 
     try:
         metadata = extract_metadata(pdf_path)
@@ -792,33 +401,8 @@ def main() -> None:
         error(f"Metadata extraction failed: {e}")
         metadata = {}
 
-    vt_results: Dict[str, Any] = {}
-    api_key = load_config().get("virustotal_api_key")
-
-    if api_key:
-
-        sha256 = metadata.get("SHA256")
-
-        if sha256 and sha256 != "Error":
-            status("Querying VirusTotal...")
-            try:
-                vt_results = query_virustotal(sha256, api_key)
-            except Exception as e:
-                log.error(f"VirusTotal query failed: {e}")
-                vt_results = {"Found": False, "Error": str(e)}
-
-            metadata["VirusTotal"] = vt_results
-    else:
-        status("No VirusTotal API key configured — skipping (offline analysis)")
-
-    print_section("METADATA ANALYSIS")
+    print_section("METADATA EXTRACTION")
     print_dictionary(metadata)
-
-    if vt_results and vt_results.get("Found"):
-        print_section("VIRUSTOTAL")
-        print_dictionary(vt_results)
-    else:
-        print(f"\n{D}No VirusTotal results{RS}")
 
     # ==========================================
     # EMBEDDED OBJECT ANALYSIS
@@ -830,6 +414,11 @@ def main() -> None:
     # (modules.parsers.iocs -> modules.threat_intel_pipeline ->
     # modules.threat_intel.engine) — so IOC lookups happen exactly once
     # per run, with no duplicate lookups downstream.
+    #
+    # HASH ENRICHMENT (Step 9): All hashes — from PDF text, extracted
+    # embedded files, and now the metadata file itself — are extracted
+    # as IOCs and enriched through the threat-intelligence pipeline.
+    # No direct VirusTotal calls bypass the Engine anymore.
 
     status("Analyzing embedded objects (header/streams/js/iocs/forms)...")
 

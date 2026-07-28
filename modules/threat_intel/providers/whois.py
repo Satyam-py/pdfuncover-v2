@@ -49,6 +49,7 @@ from modules.threat_intel.models import (
     DomainContext,
     LookupError,
 )
+from modules.threat_intel.providers.helpers import normalize_domain
 
 from modules.logging_config import get_logger
 log = get_logger(__name__, "analyzer.log")
@@ -363,21 +364,34 @@ def _build_domain_context(parsed):
 # DOMAIN
 # ==========================================
 
-def lookup_domain(domain):
-    """Look up a domain's WHOIS registration facts."""
+def lookup_domain(domain, api_key=None):
+    """Look up a domain's WHOIS registration facts.
+    
+    Args:
+        domain: The domain name to look up.
+        api_key: Unused (WHOIS requires no API key). Accepted for signature
+                 compatibility with other providers.
+    """
 
+    # Preserve the original IOC value for reporting; normalize only the
+    # lookup target so WHOIS servers receive the registrable domain
+    # (e.g. "amazon.com") rather than a subdomain ("www.amazon.com").
     ioc = Ioc(value=domain, type=IocType.DOMAIN)
+    lookup_domain = normalize_domain(domain)
 
-    validation_error = _validate_public_domain(domain)
+    if lookup_domain != domain:
+        log.debug(f"WHOIS: normalized '{domain}' → '{lookup_domain}' for lookup")
+
+    validation_error = _validate_public_domain(lookup_domain)
 
     if validation_error:
-        log.error(f"WHOIS lookup rejected for '{domain}': {validation_error}")
+        log.error(f"WHOIS lookup rejected for '{lookup_domain}' (original: '{domain}'): {validation_error}")
         return ProviderResult(
             provider=PROVIDER_NAME, ioc=ioc, success=False,
             error=LookupError.NOT_FOUND, error_message=validation_error,
         )
 
-    text, err = _request(domain)
+    text, err = _request(lookup_domain)
     if err:
         return ProviderResult(provider=PROVIDER_NAME, ioc=ioc, success=False, error=err)
 

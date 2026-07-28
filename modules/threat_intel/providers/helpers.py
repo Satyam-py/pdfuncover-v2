@@ -10,10 +10,75 @@ burden and ensure consistent error handling.
 import logging
 
 import requests
+import tldextract
 
 from modules.threat_intel.models import LookupError
 
+# Single offline-only extractor — suffix_list_urls=() disables all
+# outbound HTTP fetches; tldextract uses its bundled PSL snapshot only.
+# Created once at import time and reused by every normalize_domain() call.
+_extractor = tldextract.TLDExtract(suffix_list_urls=())
+
 log = logging.getLogger(__name__)
+
+
+# ==========================================
+# DOMAIN NORMALIZATION
+# ==========================================
+
+def normalize_domain(hostname):
+    """
+    Return the registrable (eTLD+1) domain for *hostname* using the
+    Public Suffix List via ``tldextract``.
+
+    This lets WHOIS and RDAP providers query the correct registrant
+    domain (e.g. ``amazon.com``) when they receive a subdomain IOC
+    (e.g. ``www.amazon.com``), without mutating the original IOC value.
+
+    Handles:
+    - Leading/trailing whitespace and trailing dots
+    - Uppercase input (normalized to lowercase)
+    - Already-registrable domains (returned unchanged)
+    - Bare hostnames / IPs / unknowns (returned as-is — never raises)
+
+    Args:
+        hostname (str): Raw hostname or domain string.
+
+    Returns:
+        str: Registrable domain (``example.co.uk``) if determinable,
+             otherwise the cleaned input as a safe fallback.
+    """
+    if not hostname:
+        return hostname
+
+    cleaned = hostname.strip().rstrip(".").lower()
+
+    # Strip an optional port (e.g. "example.com:8080")
+    if ":" in cleaned:
+        cleaned = cleaned.split(":")[0]
+
+    if not cleaned:
+        return hostname
+
+    try:
+        extracted = _extractor(cleaned)
+        # extracted.registered_domain is "" when tldextract cannot
+        # determine a valid eTLD+1 (bare label, IP, unknown TLD, …)
+        # top_domain_under_public_suffix is the non-deprecated name for
+        # registered_domain (same behaviour, renamed in tldextract ≥ 5).
+        # Fall back to registered_domain for older installed versions.
+        registrable = (
+            extracted.top_domain_under_public_suffix
+            if hasattr(extracted, "top_domain_under_public_suffix")
+            else extracted.registered_domain
+        )
+        if registrable:
+            return registrable
+    except Exception as exc:
+        log.debug(f"normalize_domain: tldextract failed for '{hostname}': {exc}")
+
+    # Safe fallback — return the cleaned string rather than crashing.
+    return cleaned
 
 
 # ==========================================
